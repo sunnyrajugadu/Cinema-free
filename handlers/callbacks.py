@@ -1036,7 +1036,7 @@ def filter_language_files(
 
 
 # ============================================================
-# FORCE SUB RETRY CALLBACK (FIXED)
+# FORCE SUB RETRY CALLBACK
 # ============================================================
 
 @app.on_callback_query(
@@ -1048,19 +1048,7 @@ async def fsub_retry_callback(
 ):
     try:
         user_id = query.from_user.id
-        raw_data = query.data
-
-        # Parse callback: fsub_retry:message_id:payload safely
-        parts = raw_data.split(":", 2)
-        reply_to_id = None
-        payload = ""
-
-        if len(parts) == 3:
-            if parts[1].isdigit():
-                reply_to_id = int(parts[1])
-            payload = parts[2].strip()
-        elif len(parts) == 2:
-            payload = parts[1].strip()
+        raw_data = query.data.split(":", 1)[1].strip()
 
         # Re-check channel membership
         if not await is_subscribed(client, user_id):
@@ -1069,7 +1057,20 @@ async def fsub_retry_callback(
                 show_alert=True
             )
 
-        await query.answer("✅ Verified! Fetching files...")
+        # Parse message_id and payload if packed together
+        reply_to_id = None
+        payload = raw_data
+        if ":" in raw_data:
+            parts = raw_data.split(":", 1)
+            if parts[0].isdigit():
+                reply_to_id = int(parts[0])
+                payload = parts[1].strip()
+
+        # Fallback to direct reply_to_message if present
+        if not reply_to_id and query.message and query.message.reply_to_message:
+            reply_to_id = query.message.reply_to_message.id
+
+        await query.answer("✅ Verified! Processing request...")
 
         # Delete the FSub warning prompt
         try:
@@ -1107,7 +1108,8 @@ async def fsub_retry_callback(
         # ================= ROUTE COMMANDS ================= #
         if payload.startswith("/"):
             cmd = payload.split()[0].lower()
-            dummy_msg = query.message
+
+            dummy_msg = query.message.reply_to_message if (query.message and query.message.reply_to_message) else query.message
 
             if cmd == "/ping":
                 from handlers.ping import ping_command
@@ -1123,8 +1125,11 @@ async def fsub_retry_callback(
 
             elif cmd == "/start":
                 from handlers.start import start_command
-                parts_cmd = payload.split()
-                dummy_msg.command = ["start", parts_cmd[1]] if len(parts_cmd) > 1 else ["start"]
+                parts = payload.split()
+                if len(parts) > 1:
+                    dummy_msg.command = ["start", parts[1]]
+                else:
+                    dummy_msg.command = ["start"]
                 await start_command(client, dummy_msg)
 
             else:
@@ -1134,25 +1139,15 @@ async def fsub_retry_callback(
                 )
 
         else:
-            # ================= EXECUTE SEARCH ================= #
+            # ================= EXECUTE SEARCH WITH DIRECT QUOTE REPLY ================= #
             from handlers.search import execute_search
-            try:
-                await execute_search(
-                    client=client,
-                    user=query.from_user,
-                    chat_id=user_id,
-                    movie_name=payload,
-                    reply_to_message_id=reply_to_id
-                )
-            except Exception:
-                # If replying fails due to deleted original message, run without reply_to_message_id
-                await execute_search(
-                    client=client,
-                    user=query.from_user,
-                    chat_id=user_id,
-                    movie_name=payload,
-                    reply_to_message_id=None
-                )
+            await execute_search(
+                client=client,
+                user=query.from_user,
+                chat_id=user_id,
+                movie_name=payload,
+                reply_to_message_id=reply_to_id
+            )
 
     except Exception as e:
         print(f"❌ FSUB RETRY CALLBACK ERROR: {e}", flush=True)
