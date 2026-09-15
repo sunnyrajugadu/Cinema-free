@@ -17,16 +17,29 @@ async def is_subscribed(client, user_id: int) -> bool:
 
     try:
         target_chat = AUTH_CHANNEL
+        
+        # Parse channel ID properly whether it is int, str, negative ID, or username
         if isinstance(target_chat, str):
             target_chat = target_chat.strip()
-            if target_chat.startswith("-100") and target_chat[4:].isdigit():
+            # Handles -100..., -..., or purely digits safely
+            if target_chat.startswith("-") and target_chat[1:].isdigit():
                 target_chat = int(target_chat)
             elif target_chat.isdigit():
                 target_chat = int(target_chat)
 
         member = await client.get_chat_member(chat_id=target_chat, user_id=user_id)
 
-        if member.status in [ChatMemberStatus.BANNED, ChatMemberStatus.LEFT, "kicked", "left"]:
+        # Pyrogram statuses where the user is NOT considered an active participant
+        invalid_statuses = {
+            ChatMemberStatus.BANNED,
+            ChatMemberStatus.LEFT,
+            ChatMemberStatus.RESTRICTED,
+            "kicked",
+            "left",
+            "restricted"
+        }
+
+        if member.status in invalid_statuses:
             return False
 
         return True
