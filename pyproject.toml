@@ -1,2 +1,10 @@
+[project]
+name = "cinema-bot"
+version = "0.1.0"
+description = "Telegram bot"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
 [tool.vercel]
-entrypoint = "bot:app"
+entrypoint = "Cinema-free-main.bot:app"
