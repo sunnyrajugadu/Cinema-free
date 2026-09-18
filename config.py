@@ -1,64 +1,32 @@
-import os
-from dotenv import load_dotenv
-
-load_dotenv()
-
-
-def get_env(key: str, required=True):
-    value = os.getenv(key)
-    if required and not value:
-        raise RuntimeError(
-            f"Missing required environment variable: {key}"
-        )
-    return value
-
-
 # ================= TELEGRAM ================= #
 
-API_ID = int(
-    get_env("API_ID")
-)
+API_ID = 35466805
 
-API_HASH = get_env(
-    "API_HASH"
-)
+API_HASH = "27e690713a258a2dd76b96e751d49da0"
 
-BOT_TOKEN = get_env(
-    "BOT_TOKEN"
-)
+BOT_TOKEN = "8919026800:AAFH_VDurIoPx9bF1P1eyfsJORZOXL4y0Ms"
 
 
 # User session (ONLY for reindex)
 
-USER_SESSION = get_env(
-    "USER_SESSION",
-    required=False
-)
+USER_SESSION = "BQIdLjUAqmYZ6hNyh7F0PQZ2bjMMpucFaf06oRGnWamrZRhfhDtJk3djteZajl84eO4hdxNKWab8_stTy0nTCjO-8GKQK7ywjCakcXL3903YcDPljtZkeh1E_lHLhpjuLvZebIaEzMdfNHIZ0Agl_cJJ9D1s_rKsFrB7WiqhIT99-YJQUQMGbch0TEcaK1K1D4tAVVTYCbCs1iM_OD8f0CW0BNxGbOFhrnRz-7WSOR6hWkzyVwl8_AnhFMiY4RFcJs0Qlu3cJ-pu4L1pROjOx3NrLtSwNCobK4JeFa1f41K35jWeWNxiBqoQo9P4zGMbejoDeGt_-Ngj90nqDysRd0-scDBPlwAAAAFyltn5AA"
 
 
 # ================= DATABASE ================= #
 
-MONGO_URI = get_env(
-    "MONGO_URI"
-)
+MONGO_URI = "mongodb+srv://cinemaveta:d1dlRaOFGewEIXLM@cluster0.ttuxrwf.mongodb.net/?appName=Cluster0"
 
 
 # ================= CHANNELS ================= #
 
-STORAGE_CHANNEL_ID = get_env(
-    "STORAGE_CHANNEL_ID"
-)
+STORAGE_CHANNEL_ID = "@mydbdont"
 
-LOG_CHANNEL_ID = get_env(
-    "LOG_CHANNEL_ID"
-)
+LOG_CHANNEL_ID = "@sex45min"
 
 # Force Subscribe Channel Details
-AUTH_CHANNEL = get_env("AUTH_CHANNEL")
+AUTH_CHANNEL = "@mrDuDeHoLic"
 
-CHANNEL_INVITE_LINK = get_env(
-    "CHANNEL_INVITE_LINK"
-)
+CHANNEL_INVITE_LINK = "https://t.me/mrDuDeHoLic"
 
 # START IMAGES #
 START_IMAGES = [
@@ -116,28 +84,19 @@ STATS_VIDEO = "https://www.image2url.com/r2/default/videos/1789457566226-54a7580
 USAGE_VIDEO = "https://www.image2url.com/r2/default/videos/1789457566226-54a75803-7c40-4972-8a95-c9b3ed87a538.mp4"  
 
 
-
-
-
 # ================= OWNER ================= #
 
-OWNER_ID = int(
-    get_env("OWNER_ID")
-)
+OWNER_ID = 6217456121
 
 
 # ================= GROUP ================= #
 
-GROUP_LINK = get_env(
-    "GROUP_LINK"
-)
+GROUP_LINK = "https://t.me/TeluguPrime1"
 
 
 # ================= BOT ================= #
 
-BOT_USERNAME = get_env(
-    "BOT_USERNAME"
-)
+BOT_USERNAME = "CinemaVetaBot"
 
 
 # ================= BOT SETTINGS ================= #
