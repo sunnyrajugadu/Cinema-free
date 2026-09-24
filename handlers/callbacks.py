@@ -1861,7 +1861,7 @@ async def pagination(
 
 
 # ============================================================
-# SEND ALL FILES
+# SEND ALL FILES (EXACT CURRENT PAGE ONLY)
 # ============================================================
 
 @app.on_callback_query(
@@ -1926,13 +1926,24 @@ async def send_all_files(
             )
 
         # ====================================================
-        # CURRENT PAGE FILES
+        # EXTRACT EXACT CURRENT PAGE FILES (MAX 7 PER PAGE)
         # ====================================================
 
-        files = cache.get(
-            "current_files",
-            []
-        )
+        current_page = cache.get("current_page") or cache.get("page") or 1
+        selected_lang = cache.get("selected_language") or "All"
+        original_files = cache.get("files", [])
+
+        # Filter by selected language
+        filtered_files = filter_language_files(original_files, selected_lang)
+
+        # Calculate exact slice for current page
+        start = (int(current_page) - 1) * FILES_PER_PAGE
+        end = start + FILES_PER_PAGE
+        files = filtered_files[start:end]
+
+        # Fallback to current_files if slice resulted empty
+        if not files:
+            files = cache.get("current_files", [])[:FILES_PER_PAGE]
 
         if not files:
 
