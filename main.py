@@ -1,7 +1,3 @@
-"""
-CinemaVeta – main entry point
-"""
-
 import asyncio
 import os
 import sys
