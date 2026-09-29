@@ -715,7 +715,7 @@ def file_button(
 
     return InlineKeyboardButton(
         text=(
-            f"{size} | "
+            f"[{size}]-"
             f"{display_name}"
         ),
         callback_data=(
