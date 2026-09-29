@@ -1091,7 +1091,7 @@ async def fsub_retry_callback(
             await client.send_message(
                 chat_id=user_id,
                 text=(
-                    "✅ <b>Verification Successful!</b>\n\n"
+                    "✅ <b>Joined Successful!</b>\n\n"
                     "**Click the button below to search and download files directly** 🥀"
                 ),
                 reply_markup=inline_launch_markup
