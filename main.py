@@ -67,7 +67,7 @@ async def set_commands(app):
             BotCommand("stats", "Bot statistics"),
             # ================= OWNER COMMANDS ================= #
             BotCommand("owner", "Owner Commands"),
-            BotCommand("generate_link", "(Owner Only)")
+            BotCommand("generate_link", "Gen File Link")
         ]
     )
     print("✅ All bot commands registered", flush=True)
