@@ -3,7 +3,6 @@ from pyrogram.types import Message
 
 from bot import app
 from database.models import files
-from filters.owner import owner_filter
 
 
 print(
@@ -86,7 +85,7 @@ async def find_file_by_unique_id(file_unique_id):
 # ============================================================
 
 @app.on_message(
-    filters.command("generate_link") & owner_filter
+    filters.command("generate_link")
 )
 async def generate_link(
     client,
