@@ -57,13 +57,13 @@ async def set_commands(app):
         [
             # ================= USER COMMANDS ================= #
             BotCommand("start", "Start CinemaVeta"),
-            BotCommand("search", "Search movies"),
+            BotCommand("imdb", "Search movie or series details on IMDb"),
             BotCommand("ping", "Check bot ping"),
             BotCommand("usage", "Bot Usage"),
             BotCommand("stats", "Bot statistics"),
+            BotCommand("generate_link", "Gen File Link"),
             # ================= OWNER COMMANDS ================= #
-            BotCommand("owner", "Owner Commands"),
-            BotCommand("generate_link", "Gen File Link")
+            BotCommand("owner", "Owner Commands")
         ]
     )
     print("✅ All bot commands registered", flush=True)
@@ -98,6 +98,9 @@ async def main():
     import handlers.delete
     import handlers.deep_links
     import handlers.inline
+    import handlers.imdb
+    
+    
 
     print("✅ Handlers Loaded", flush=True)
 

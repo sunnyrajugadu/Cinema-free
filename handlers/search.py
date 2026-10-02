@@ -1,6 +1,11 @@
 import asyncio
+import time
+import html
+import re
 from datetime import datetime
 import uuid
+import aiohttp
+import urllib.parse
 
 from pyrogram import filters
 from pyrogram.types import (
@@ -12,6 +17,7 @@ from pyrogram.types import (
 from bot import app
 from config import LOG_CHANNEL_ID
 from filters.fsub import enforce_fsub
+from utils.helpers import get_imdb_suggestions, get_imdb_movie_details
 from database.models import (
     search_files,
     increase_search_count,
@@ -37,6 +43,15 @@ FIXED_LANGUAGES = [
     "Kannada"
 ]
 
+TMDB_LANG_MAP = {
+    "Telugu": "te",
+    "Tamil": "ta",
+    "Hindi": "hi",
+    "Malayalam": "ml",
+    "Kannada": "kn",
+    "English": "en"
+}
+
 
 # ================= SIZE FORMAT ================= #
 
@@ -58,47 +73,38 @@ def format_size(size):
     return f"{size:.0f} B"
 
 
-# ================= FORMAT AUDIO ================= #
+# ================= EXTRACT AUDIO LANGUAGES ================= #
 
-def format_audio(audio):
-    if isinstance(audio, list):
-        values = [
-            str(item).strip()
-            for item in audio
-            if item
-            and str(item).strip().lower()
-            not in {
-                "unknown",
-                "none",
-                "null",
-                "n/a",
-                "na"
-            }
-        ]
+KNOWN_LANGS = {
+    "telugu": "Telugu",
+    "tamil": "Tamil",
+    "hindi": "Hindi",
+    "english": "English",
+    "malayalam": "Malayalam",
+    "kannada": "Kannada"
+}
 
-        if values:
-            return ", ".join(dict.fromkeys(values))
+def extract_file_languages(file):
+    found = set()
 
-        return ""
+    for key in ("audio", "languages", "language"):
+        val = file.get(key)
+        if isinstance(val, list):
+            for v in val:
+                v_str = str(v).strip().lower()
+                if v_str in KNOWN_LANGS:
+                    found.add(KNOWN_LANGS[v_str])
+        elif isinstance(val, str) and val:
+            for word, label in KNOWN_LANGS.items():
+                if re.search(rf"\b{word}\b", val, re.IGNORECASE):
+                    found.add(label)
 
-    if audio is None:
-        return ""
+    text_to_scan = f"{file.get('file_name', '')} {file.get('original_file_name', '')} {file.get('movie_name', '')}"
+    for word, label in KNOWN_LANGS.items():
+        if re.search(rf"\b{word}\b", text_to_scan, re.IGNORECASE):
+            found.add(label)
 
-    audio = str(audio).strip()
-
-    if not audio:
-        return ""
-
-    if audio.lower() in {
-        "unknown",
-        "none",
-        "null",
-        "n/a",
-        "na"
-    }:
-        return ""
-
-    return audio
+    return list(found)
 
 
 # ================= FILE DISPLAY NAME ================= #
@@ -124,6 +130,80 @@ def get_file_display_name(file):
         return fallback
 
     return "Movie"
+
+
+# ================= SMART MOVIE NAME CLEANER ================= #
+
+def clean_movie_base_title(raw_name: str, query: str = "") -> str:
+    from utils.rename import clean_file_name
+
+    title = clean_file_name(raw_name)
+
+    # 1. Strip URLs & domains
+    title = re.sub(r"https?://\S+|www\.\S+|\b[a-zA-Z0-9_\-\.]+\.(com|org|net|in|top|click|link|xyz|site|fun|lol)\b", "", title, flags=re.IGNORECASE)
+
+    # 2. Strip telegram channel handles & prefixes
+    if query:
+        q_clean = query.strip()
+        match = re.search(re.escape(q_clean), title, flags=re.IGNORECASE)
+        if match and match.start() > 0:
+            title = title[match.start():]
+
+    # Preserve release year
+    year_match = re.search(r"\b(19\d\d|20\d\d)\b", title)
+    preserved_year = year_match.group(1) if year_match else ""
+
+    # 3. Strip all prints, resolutions, audios, codecs and tech flags
+    tech_patterns = r"\b(20\d\d|19\d\d|720p|1080p|480p|2160p|4k|hq|prehd|hdrip|webrip|web-dl|web|dvdrip|cam|camrip|hdtc|hevc|x264|x265|aac|ac3|ddp|esub|sub|vers?|hdr|truehd|remux|avc)\b.*"
+    title = re.sub(tech_patterns, "", title, flags=re.IGNORECASE)
+
+    # 4. Strip languages from tail
+    title = re.sub(r"\b(telugu|tamil|hindi|english|malayalam|kannada|multi|dual\s*audio)\b", "", title, flags=re.IGNORECASE)
+
+    # 5. Clean trailing isolated letters/tags (e.g., 'H', 'X', 'X2', 'Aa', 'He', 'V1')
+    title = re.sub(r"\b(h|x|x2|aa|he|v1|v2|org|hq)\b", "", title, flags=re.IGNORECASE)
+
+    # 6. Normalize punctuation and spaces
+    title = re.sub(r"[_.\-+:]+", " ", title)
+    title = re.sub(r"[^\w\s]", "", title)
+    title = re.sub(r"\s+", " ", title).strip()
+
+    if preserved_year and preserved_year not in title and len(title.split()) == 1:
+        title = f"{title} {preserved_year}"
+
+    return title
+
+
+def extract_distinct_movies(files_list, search_query: str):
+    query_norm = search_query.lower().strip()
+    raw_titles = []
+
+    for f in files_list:
+        raw = f.get("movie_name") or f.get("file_name") or f.get("original_file_name") or ""
+        clean = clean_movie_base_title(raw, query=search_query)
+        if clean and len(clean) >= 3 and query_norm in clean.lower():
+            raw_titles.append(clean)
+
+    # Group similar titles into root names
+    distinct = []
+    for cand in sorted(raw_titles, key=len):
+        cand_lower = cand.lower().strip()
+        matched = False
+        for idx, exist in enumerate(distinct):
+            exist_lower = exist.lower().strip()
+            if cand_lower.startswith(exist_lower) or exist_lower.startswith(cand_lower):
+                matched = True
+                break
+        if not matched:
+            distinct.append(cand)
+
+    collapsed = []
+    for t in distinct:
+        t_clean = t.title()
+        if not any(t_clean.lower().startswith(c.lower()) and len(t_clean) > len(c) for c in collapsed):
+            collapsed.append(t_clean)
+
+    return collapsed if collapsed else [search_query.title()]
 
 
 # ================= SEARCH LOG ================= #
@@ -170,6 +250,16 @@ async def log_search(
 
     except Exception as e:
         print(f"❌ SEARCH LOG ERROR : {e}", flush=True)
+
+
+# ================= AUTO DELETE HELPER ================= #
+
+async def auto_delete_message(message, delay_seconds: int = 40):
+    try:
+        await asyncio.sleep(delay_seconds)
+        await message.delete()
+    except Exception:
+        pass
 
 
 # ================= LANGUAGE BUTTONS ================= #
@@ -249,7 +339,7 @@ def pagination_buttons(
     if page > 1:
         row.append(
             InlineKeyboardButton(
-                "⬅️ Previous",
+                "⬅ Previous",
                 callback_data=(
                     f"page:"
                     f"{search_id}:"
@@ -284,17 +374,60 @@ def pagination_buttons(
 
 # ================= CORE SEARCH EXECUTION ================= #
 
-async def execute_search(client, user, chat_id, movie_name, reply_to_message_id=None):
-    """
-    Executes search and sends the files. Can be called from message handler or callback.
-    """
+async def execute_search(
+    client,
+    user,
+    chat_id,
+    movie_name,
+    reply_to_message_id=None,
+    allow_spelling_suggestions=True
+):
+    start_time = time.time()
     try:
         user_id = user.id
         print(f"🔍 SEARCH : {movie_name}", flush=True)
 
         asyncio.create_task(increase_search_count(user_id))
 
+        # 1. Search database
         results = await search_files(movie_name)
+
+        if not results and "(" in movie_name:
+            clean_name = movie_name.split("(")[0].strip()
+            if clean_name:
+                results = await search_files(clean_name)
+
+        # 2. Check if DB has genuinely multiple franchise parts
+        if results and allow_spelling_suggestions:
+            distinct_db_movies = extract_distinct_movies(results, movie_name)
+
+            if len(distinct_db_movies) > 1 and not (len(distinct_db_movies) == 1 and distinct_db_movies[0].lower() == movie_name.lower()):
+                query_words = len(movie_name.strip().split())
+                if query_words <= 2:
+                    buttons = []
+                    for title in distinct_db_movies[:8]:
+                        buttons.append([
+                            InlineKeyboardButton(
+                                title,
+                                callback_data=f"spell:{user_id}:{title[:45]}"
+                            )
+                        ])
+
+                    buttons.append([InlineKeyboardButton("✘ CLOSE ✘", callback_data="close")])
+
+                    prompt_msg = await client.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"🎬 **Multiple movies found for:** `{movie_name}`\n\n"
+                            "👇 **Please select which movie you want:**"
+                        ),
+                        reply_markup=InlineKeyboardMarkup(buttons),
+                        reply_to_message_id=reply_to_message_id
+                    )
+
+                    if prompt_msg:
+                        asyncio.create_task(auto_delete_message(prompt_msg, delay_seconds=45))
+                    return
 
         asyncio.create_task(
             log_search(
@@ -305,27 +438,133 @@ async def execute_search(client, user, chat_id, movie_name, reply_to_message_id=
             )
         )
 
-        # ================= NO RESULTS ================= #
+        # ================= NO RESULTS / SPELLING SUGGESTIONS ================= #
         if not results:
+            # 1. First check for spelling mistakes using IMDb suggestions
+            if allow_spelling_suggestions:
+                suggestions = await get_imdb_suggestions(movie_name, limit=8)
+                if suggestions:
+                    suggestion_buttons = []
+                    for title in suggestions:
+                        clean_disp = title.split("(")[0].strip() if "(" in title else title
+                        cb_data = f"spell:{user_id}:{clean_disp[:45]}"
+                        suggestion_buttons.append([InlineKeyboardButton(clean_disp, callback_data=cb_data)])
+
+                    suggestion_buttons.append([InlineKeyboardButton("✘ CLOSE ✘", callback_data="close")])
+
+                    reply_text = (
+                        f"`{movie_name}`\n\n"
+                        "**Spelling Mistake Bro ‼️**\n\n"
+                        "**DON'T WORRY 😊 CHOOSE THE CORRECT ONE BELOW 👇**"
+                    )
+
+                    spell_msg = await client.send_message(
+                        chat_id=chat_id,
+                        text=reply_text,
+                        reply_markup=InlineKeyboardMarkup(suggestion_buttons),
+                        reply_to_message_id=reply_to_message_id
+                    )
+
+                    if spell_msg:
+                        asyncio.create_task(auto_delete_message(spell_msg, delay_seconds=30))
+                    return
+
+            # 2. Pure No Results: Display the requested prompt & buttons
+            google_query = urllib.parse.quote_plus(movie_name)
+            google_search_url = f"https://www.google.com/search?q={google_query}"
+
+            no_result_text = f"""✨ **Oops! I couldn't find "{movie_name}" in my database** 📀
+
+🔍 **Search on Google and check if your spelling is correct.**
+
+📖 **Please read the instructions to get better results.**"""
+
+            no_result_buttons = [
+                [
+                    InlineKeyboardButton("‼️ INSTRUCTIONS ‼️", callback_data="search_instructions")
+                ],
+                [
+                    InlineKeyboardButton("♻️ GOOGLE SEARCH ♻️", url=google_search_url)
+                ]
+            ]
+
             no_result_message = await client.send_message(
                 chat_id=chat_id,
-                text=f"""
-🪄 **Oops! I couldn't find :** `{movie_name}` 📀
-
-🔎 **Try a different spelling or share more details so I can hunt it down!** 🍿
-""",
+                text=no_result_text,
+                reply_markup=InlineKeyboardMarkup(no_result_buttons),
                 reply_to_message_id=reply_to_message_id
             )
 
-            try:
-                await asyncio.sleep(10)
-                await no_result_message.delete()
-            except Exception:
-                pass
+            if no_result_message:
+                asyncio.create_task(auto_delete_message(no_result_message, delay_seconds=40))
 
             return
 
-        # ================= SEARCH ID ================= #
+        # ================= SEARCH METRICS & DETAILS ================= #
+        elapsed_sec = f"{time.time() - start_time:.2f}"
+        total_files_count = len(results)
+
+        user_name = user.first_name or "User"
+        user_mention = f'<a href="tg://user?id={user.id}"><b>{html.escape(user_name)}</b></a>'
+
+        # Detect audio languages
+        detected_audios = set()
+        for f in results:
+            langs = extract_file_languages(f)
+            detected_audios.update(langs)
+
+        priority_order = ["Telugu", "Tamil", "Hindi", "English", "Malayalam", "Kannada"]
+        sorted_audios = [l for l in priority_order if l in detected_audios]
+        for l in detected_audios:
+            if l not in sorted_audios:
+                sorted_audios.append(l)
+
+        audio_str = ", ".join(sorted_audios) if sorted_audios else "Multi"
+
+        # Dynamically determine original language for TMDB
+        target_lang = "te"
+        for l in sorted_audios:
+            if l in TMDB_LANG_MAP:
+                target_lang = TMDB_LANG_MAP[l]
+                break
+
+        # Fetch Landscape Movie Banner & Details from TMDB
+        movie_details = await get_imdb_movie_details(movie_name, preferred_lang=target_lang)
+        landscape_banner_url = movie_details.get("image") if movie_details else None
+
+        # Direct IMDb Movie Details Caption
+        caption_lines = []
+
+        if movie_details and movie_details.get("title"):
+            m_title = movie_details['title']
+            if movie_details.get("year"):
+                m_title += f" ({movie_details['year']})"
+            caption_lines.append(f"🎬 <b>{html.escape(m_title)}</b>\n")
+        else:
+            caption_lines.append(f"🎬 <b>{html.escape(movie_name.title())}</b>\n")
+
+        if movie_details:
+            if movie_details.get("rating") and movie_details["rating"] != "N/A":
+                caption_lines.append(f"⭐ <b>RATING :</b> <code>{movie_details['rating']} / 10</code>")
+
+            if movie_details.get("genres") and movie_details["genres"] != "N/A":
+                caption_lines.append(f"🎭 <b>GENRE :</b> <code>{movie_details['genres']}</code>")
+
+            if movie_details.get("runtime") and movie_details["runtime"] != "N/A":
+                caption_lines.append(f"⏳ <b>RUN TIME :</b> <code>{movie_details['runtime']}</code>")
+
+        caption_lines.append(f"🔊 <b>AUDIO :</b> <code>{audio_str}</code>\n")
+
+        caption_lines.extend([
+            f"📁 <b>TOTAL FILES :</b> <code>{total_files_count}</code>",
+            f"📝 <b>REQUESTED BY :</b> {user_mention}",
+            f"⏰ <b>RESULT IN :</b> <code>{elapsed_sec} s</code>\n",
+            "🥦 <b><i>Requested Files</i></b> 👇"
+        ])
+
+        final_caption = "\n".join(caption_lines)
+
+        # ================= SEARCH ID & CACHING ================= #
         search_id = str(uuid.uuid4())
         menu_timestamp = int(datetime.now().timestamp())
 
@@ -338,14 +577,13 @@ async def execute_search(client, user, chat_id, movie_name, reply_to_message_id=
         asyncio.create_task(save_search_cache(search_id, cache_files, movie_name))
         asyncio.create_task(update_search_state(search_id, cache_files[:PAGE_LIMIT], "All", 1))
 
-        # ================= BUILD FILE BUTTONS ================= #
+        # ================= BUILD BUTTONS ================= #
         buttons = []
         for file in cache_files[:PAGE_LIMIT]:
             buttons.append(
                 [build_file_button(file, user_id, menu_timestamp)]
             )
 
-        # ================= LANGUAGE BUTTONS ================= #
         buttons.extend(
             language_buttons(
                 search_id=search_id,
@@ -354,7 +592,6 @@ async def execute_search(client, user, chat_id, movie_name, reply_to_message_id=
             )
         )
 
-        # ================= SEND ALL ================= #
         buttons.append(
             [
                 InlineKeyboardButton(
@@ -369,7 +606,6 @@ async def execute_search(client, user, chat_id, movie_name, reply_to_message_id=
             ]
         )
 
-        # ================= PAGINATION ================= #
         buttons.extend(
             pagination_buttons(
                 search_id,
@@ -379,19 +615,47 @@ async def execute_search(client, user, chat_id, movie_name, reply_to_message_id=
             )
         )
 
-        # ================= SEND RESULT (WITH REPLY PREVIEW) ================= #
-        await client.send_message(
-            chat_id=chat_id,
-            text=f"""
-🌟✨ **Movie Request:** `{movie_name}` 🪄
+        reply_markup = InlineKeyboardMarkup(buttons)
 
-🍿 **Here is your files!**
-""",
-            reply_markup=InlineKeyboardMarkup(buttons),
-            reply_to_message_id=reply_to_message_id
-        )
+        # ================= DISPATCH PHOTO BANNER ================= #
+        sent_success = False
+        if landscape_banner_url:
+            try:
+                await client.send_photo(
+                    chat_id=chat_id,
+                    photo=landscape_banner_url,
+                    caption=final_caption,
+                    reply_markup=reply_markup,
+                    reply_to_message_id=reply_to_message_id
+                )
+                sent_success = True
+            except Exception as pe:
+                print(f"⚠️ Landscape direct URL failed ({pe}), attempting stream...", flush=True)
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(landscape_banner_url, timeout=aiohttp.ClientTimeout(total=4)) as img_resp:
+                            if img_resp.status == 200:
+                                img_bytes = await img_resp.read()
+                                await client.send_photo(
+                                    chat_id=chat_id,
+                                    photo=img_bytes,
+                                    caption=final_caption,
+                                    reply_markup=reply_markup,
+                                    reply_to_message_id=reply_to_message_id
+                                )
+                                sent_success = True
+                except Exception as b_err:
+                    print(f"⚠️ Stream fallback error: {b_err}", flush=True)
 
-        print("✅ SEARCH RESULT SENT", flush=True)
+        if not sent_success:
+            await client.send_message(
+                chat_id=chat_id,
+                text=final_caption,
+                reply_markup=reply_markup,
+                reply_to_message_id=reply_to_message_id
+            )
+
+        print("✅ SEARCH RESULT SENT SUCCESSFULLY", flush=True)
 
     except Exception as e:
         print(f"❌ SEARCH ERROR : {e}", flush=True)
@@ -417,7 +681,8 @@ async def execute_search(client, user, chat_id, movie_name, reply_to_message_id=
             "usage",
             "owner",
             "delete",
-            "generate_link"
+            "generate_link",
+            "imdb"
         ]
     )
 )
@@ -429,13 +694,11 @@ async def search_movie_handler(
         if not message.from_user:
             return
 
-        # 1. Ignore messages sent via Inline Query (Prevents Oops error on inline clicks)
         if message.via_bot:
             return
 
         movie_name = (message.text or "").strip()
 
-        # 2. Ignore messages that contain inline file text / captions
         if (
             "Size :-" in movie_name
             or "Size:" in movie_name
@@ -446,29 +709,28 @@ async def search_movie_handler(
         ):
             return
 
-        # Remove bot username prefix if any
         if movie_name.startswith("@"):
             parts = movie_name.split()
             movie_name = " ".join(parts[1:])
 
-        # Remove /search command prefix if typed in PM
         if movie_name.lower().startswith("/search"):
             movie_name = movie_name[7:].strip()
 
         if not movie_name:
             return
 
-        # ================= ONE-LINE FSUB ENFORCEMENT ================= #
+        # Force Subscribe Verification
         if not await enforce_fsub(client, message, payload=movie_name):
             return
 
-        # Run Search
+        # Execute search
         await execute_search(
             client=client,
             user=message.from_user,
             chat_id=message.chat.id,
             movie_name=movie_name,
-            reply_to_message_id=message.id
+            reply_to_message_id=message.id,
+            allow_spelling_suggestions=True
         )
 
     except Exception as e:
