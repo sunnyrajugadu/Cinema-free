@@ -138,7 +138,7 @@ async def start_command(
                     "emoji": "💋"
                 }
             ],
-            "is_big": False
+            "is_big": True
         }
 
         async with aiohttp.ClientSession(
