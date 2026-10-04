@@ -4,9 +4,8 @@ import asyncio
 import aiohttp
 from bson import ObjectId
 
-from pyrogram import filters, raw
+from pyrogram import filters
 from pyrogram.types import Message
-from pyrogram.raw.types import ReactionEmoji
 
 from bot import app
 from config import START_IMAGES
@@ -119,35 +118,59 @@ async def start_command(
 
     # ========================================================
     # 1. REACT TO USER'S /START COMMAND
+    # Bot API method: setMessageReaction
+    # (MTProto messages.SendReaction is user-account only)
     # ========================================================
 
     try:
-        peer = await client.resolve_peer(
-            message.chat.id
+        from config import BOT_TOKEN
+
+        reaction_url = (
+            f"https://api.telegram.org/bot{BOT_TOKEN}/setMessageReaction"
         )
 
-        await client.invoke(
-            raw.functions.messages.SendReaction(
-                peer=peer,
-                msg_id=message.id,
-                reaction=[
-                    ReactionEmoji(
-                        emoticon="💋"
+        reaction_payload = {
+            "chat_id": message.chat.id,
+            "message_id": message.id,
+            "reaction": [
+                {
+                    "type": "emoji",
+                    "emoji": "💋"
+                }
+            ],
+            "is_big": False
+        }
+
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=3.0)
+        ) as session:
+            async with session.post(
+                reaction_url,
+                json=reaction_payload
+            ) as response:
+
+                result = await response.json(
+                    content_type=None
+                )
+
+                if response.status == 200 and result.get("ok"):
+                    print(
+                        "💋 START MESSAGE REACTION SENT",
+                        flush=True
                     )
-                ]
-            )
-        )
-
-        print(
-            "💋 START MESSAGE REACTION SENT",
-            flush=True
-        )
+                else:
+                    print(
+                        f"⚠️ START REACTION FAILED: {result}",
+                        flush=True
+                    )
 
     except Exception as e:
         print(
             f"⚠️ START REACTION FAILED: {e}",
             flush=True
         )
+
+
 
 
     # ========================================================
