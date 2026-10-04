@@ -5,7 +5,7 @@ from urllib.parse import quote_plus
 
 import aiohttp
 from pyrogram import filters
-from pyrogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from pyrogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 
 from bot import app
 from utils.helpers import normalize_text
@@ -1320,6 +1320,132 @@ async def fetch_full_movie_details(
 
 
 # ============================================================
+# IMDb poster / image collection
+# ============================================================
+
+IMDB_IMAGES_PAGE_SIZE = 50
+IMDB_MEDIA_GROUP_SIZE = 10
+
+IMDB_IMAGES_QUERY = r'''
+query GetTitleImages($id: ID!, $first: Int!, $after: ID) {
+  title(id: $id) {
+    id
+    images(first: $first, after: $after) {
+      edges { cursor node { url } }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}
+'''
+
+IMDB_IMAGES_SIMPLE_QUERY = r'''
+query GetTitleImagesSimple($id: ID!, $first: Int!) {
+  title(id: $id) {
+    id
+    images(first: $first) {
+      edges { node { url } }
+    }
+  }
+}
+'''
+
+
+def normalize_image_url(url):
+    if not url:
+        return None
+    url = str(url).strip()
+    if url.startswith('//'):
+        url = 'https:' + url
+    return url if url.startswith(('http://', 'https://')) else None
+
+
+def unique_image_urls(values):
+    result, seen = [], set()
+    for value in values or []:
+        value = normalize_image_url(value)
+        if not value:
+            continue
+        key = value.casefold()
+        if key not in seen:
+            seen.add(key)
+            result.append(value)
+    return result
+
+
+async def fetch_imdb_posters(imdb_id, primary_poster=None):
+    images = []
+    if primary_poster:
+        images.append(primary_poster)
+    if not imdb_id:
+        return unique_image_urls(images)
+
+    try:
+        after = None
+        while True:
+            payload = await imdb_graphql(IMDB_IMAGES_QUERY, {
+                'id': imdb_id, 'first': IMDB_IMAGES_PAGE_SIZE, 'after': after
+            })
+            title = ((payload.get('data') or {}).get('title'))
+            if not isinstance(title, dict):
+                break
+            image_data = title.get('images') or {}
+            for edge in image_data.get('edges') or []:
+                node = edge.get('node') or {}
+                if node.get('url'):
+                    images.append(node['url'])
+            page_info = image_data.get('pageInfo') or {}
+            if not page_info.get('hasNextPage'):
+                break
+            next_cursor = page_info.get('endCursor')
+            if not next_cursor or next_cursor == after:
+                break
+            after = next_cursor
+        result = unique_image_urls(images)
+        if result:
+            return result
+    except Exception as exc:
+        print(f'IMDb Images Pagination Error [{imdb_id}]: {exc}', flush=True)
+
+    try:
+        payload = await imdb_graphql(IMDB_IMAGES_SIMPLE_QUERY, {
+            'id': imdb_id, 'first': IMDB_IMAGES_PAGE_SIZE
+        })
+        title = ((payload.get('data') or {}).get('title'))
+        if isinstance(title, dict):
+            for edge in ((title.get('images') or {}).get('edges') or []):
+                node = edge.get('node') or {}
+                if node.get('url'):
+                    images.append(node['url'])
+    except Exception as exc:
+        print(f'IMDb Images Simple Query Error [{imdb_id}]: {exc}', flush=True)
+
+    return unique_image_urls(images)
+
+
+async def send_imdb_image_batches(client, chat_id, reply_to_message_id, image_urls):
+    for start in range(0, len(image_urls), IMDB_MEDIA_GROUP_SIZE):
+        batch = image_urls[start:start + IMDB_MEDIA_GROUP_SIZE]
+        media = [InputMediaPhoto(media=url) for url in batch]
+        try:
+            await client.send_media_group(
+                chat_id=chat_id,
+                media=media,
+                reply_to_message_id=reply_to_message_id,
+            )
+        except Exception as group_error:
+            print(f'IMDb Media Group Send Error: {group_error}', flush=True)
+            for url in batch:
+                try:
+                    await client.send_photo(
+                        chat_id=chat_id,
+                        photo=url,
+                        reply_to_message_id=reply_to_message_id,
+                    )
+                except Exception as photo_error:
+                    print(f'IMDb Extra Photo Send Error: {photo_error}', flush=True)
+
+
+# ============================================================
 # /imdb command
 # ============================================================
 
@@ -1521,13 +1647,18 @@ async def imdb_view_callback(client, query: CallbackQuery):
         ]
         reply_markup = InlineKeyboardMarkup(buttons)
 
+        imdb_images = await fetch_imdb_posters(
+            imdb_id,
+            primary_poster=info.get("poster"),
+        )
+
         sent = False
 
-        if info.get("poster"):
+        if imdb_images:
             try:
                 await client.send_photo(
                     chat_id=orig_message.chat.id,
-                    photo=info["poster"],
+                    photo=imdb_images[0],
                     caption=final_caption,
                     reply_markup=reply_markup,
                     reply_to_message_id=orig_message.id,
@@ -1536,7 +1667,23 @@ async def imdb_view_callback(client, query: CallbackQuery):
             except Exception as photo_error:
                 print(f"IMDb Photo Send Error: {photo_error}", flush=True)
 
-        if not sent:
+        if len(imdb_images) > 1:
+            await send_imdb_image_batches(
+                client=client,
+                chat_id=orig_message.chat.id,
+                reply_to_message_id=orig_message.id,
+                image_urls=imdb_images[1:],
+            )
+
+        if not sent and not imdb_images:
+            await client.send_message(
+                chat_id=orig_message.chat.id,
+                text=final_caption,
+                reply_markup=reply_markup,
+                reply_to_message_id=orig_message.id,
+                disable_web_page_preview=False,
+            )
+        elif not sent and imdb_images:
             await client.send_message(
                 chat_id=orig_message.chat.id,
                 text=final_caption,
