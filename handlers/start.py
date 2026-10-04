@@ -117,9 +117,7 @@ async def start_command(
 
 
     # ========================================================
-    # 1. REACT TO USER'S /START COMMAND
-    # Bot API method: setMessageReaction
-    # (MTProto messages.SendReaction is user-account only)
+    # 1. REACT TO USER'S /START COMMAND FIRST
     # ========================================================
 
     try:
@@ -160,7 +158,7 @@ async def start_command(
                     )
                 else:
                     print(
-                        f"⚠️ START REACTION FAILED: {result}",
+                        f"⚠️️ START REACTION FAILED: {result}",
                         flush=True
                     )
 
@@ -170,207 +168,207 @@ async def start_command(
             flush=True
         )
 
-
+    # Reaction సెండ్ అయిన తర్వాత చిన్న గ్యాప్ (delay)
+    await asyncio.sleep(0.6)
 
 
     # ========================================================
-    # 2. SEND LOADING STICKER IMMEDIATELY
+    # 2. SEND STICKER AFTER REACTION
     # ========================================================
-
-    loading_msg = None
 
     try:
-        loading_msg = await message.reply_sticker(
+        await message.reply_sticker(
             LOADING_STICKER_ID,
             quote=True
         )
     except Exception:
         pass
+        
+    # Sticker సెండ్ అయిన తర్వాత మళ్ళీ చిన్న గ్యాప్
+    await asyncio.sleep(0.6)
 
 
-    try:
+    # ====================================================
+    # Background task for database and logging
+    # ====================================================
 
-        # ====================================================
-        # Background task for database and logging
-        # ====================================================
-
-        asyncio.create_task(
-            process_user_db(
-                user_id=user.id,
-                username=user.username,
-                chat_id=message.chat.id,
-                chat_type=message.chat.type.value
-            )
+    asyncio.create_task(
+        process_user_db(
+            user_id=user.id,
+            username=user.username,
+            chat_id=message.chat.id,
+            chat_type=message.chat.type.value
         )
+    )
 
 
-        # ====================================================
-        # PAYLOAD / DEEP LINK CHECK
-        # ====================================================
+    # ====================================================
+    # PAYLOAD / DEEP LINK CHECK
+    # ====================================================
 
-        if len(message.command) > 1:
+    if len(message.command) > 1:
 
-            payload = message.command[1].strip()
+        payload = message.command[1].strip()
+
+
+        # =================================================
+        # 1. INLINE FSUB TRIGGER
+        # =================================================
+
+        if payload in [
+            "inline_fsub",
+            "fsub"
+        ]:
+
+            if not await enforce_fsub(
+                client,
+                message,
+                payload=f"/start {payload}"
+            ):
+                return
+
+            return await message.reply_text(
+                "✅ <b>You have joined all required channels!</b>\n\n"
+                "You can now use Inline search freely.",
+                reply_markup=start_buttons(),
+                quote=True
+            )
+
+
+        # =================================================
+        # 2. FILE DEEP LINK
+        # =================================================
+
+        if payload.startswith("file_"):
+
+            if not await enforce_fsub(
+                client,
+                message,
+                payload=f"/start {payload}"
+            ):
+                return
+
+
+            file_id = payload.replace(
+                "file_",
+                "",
+                1
+            ).strip()
 
 
             # =================================================
-            # 1. INLINE FSUB TRIGGER
+            # ObjectId validation
             # =================================================
 
-            if payload in [
-                "inline_fsub",
-                "fsub"
-            ]:
+            try:
+                object_id = ObjectId(file_id)
 
-                if not await enforce_fsub(
-                    client,
-                    message,
-                    payload=f"/start {payload}"
-                ):
-                    return
-
+            except Exception:
                 return await message.reply_text(
-                    "✅ <b>You have joined all required channels!</b>\n\n"
-                    "You can now use Inline search freely.",
-                    reply_markup=start_buttons(),
+                    "❌ Invalid file link.",
                     quote=True
                 )
 
 
             # =================================================
-            # 2. FILE DEEP LINK
+            # Find file in database
             # =================================================
 
-            if payload.startswith("file_"):
+            try:
+                file = await files().find_one(
+                    {
+                        "_id": object_id
+                    }
+                )
 
-                if not await enforce_fsub(
-                    client,
-                    message,
-                    payload=f"/start {payload}"
+            except Exception as e:
+
+                print(
+                    f"[start] File lookup error: {e}",
+                    flush=True
+                )
+
+                return await message.reply_text(
+                    "❌ Unable to find the file.",
+                    quote=True
+                )
+
+
+            if not file:
+                return await message.reply_text(
+                    "❌ File not found.",
+                    quote=True
+                )
+
+
+            # =================================================
+            # Click logging in background
+            # =================================================
+
+            try:
+
+                file_name = (
+                    file.get("file_name")
+                    or "Unknown File"
+                )
+
+                file_size = (
+                    file.get("file_size_bytes")
+                    or 0
+                )
+
+                movie_name = (
+                    file.get("movie_name")
+                    or "Unknown"
+                )
+
+
+                if isinstance(
+                    file_size,
+                    (int, float)
                 ):
-                    return
 
+                    if file_size >= 1024 ** 3:
 
-                file_id = payload.replace(
-                    "file_",
-                    "",
-                    1
-                ).strip()
+                        size_text = (
+                            f"{file_size / (1024 ** 3):.2f} GB"
+                        )
 
+                    elif file_size >= 1024 ** 2:
 
-                # =================================================
-                # ObjectId validation
-                # =================================================
+                        size_text = (
+                            f"{file_size / (1024 ** 2):.2f} MB"
+                        )
 
-                try:
-                    object_id = ObjectId(file_id)
+                    elif file_size >= 1024:
 
-                except Exception:
-                    return await message.reply_text(
-                        "❌ Invalid file link.",
-                        quote=True
-                    )
-
-
-                # =================================================
-                # Find file in database
-                # =================================================
-
-                try:
-                    file = await files().find_one(
-                        {
-                            "_id": object_id
-                        }
-                    )
-
-                except Exception as e:
-
-                    print(
-                        f"[start] File lookup error: {e}",
-                        flush=True
-                    )
-
-                    return await message.reply_text(
-                        "❌ Unable to find the file.",
-                        quote=True
-                    )
-
-
-                if not file:
-                    return await message.reply_text(
-                        "❌ File not found.",
-                        quote=True
-                    )
-
-
-                # =================================================
-                # Click logging in background
-                # =================================================
-
-                try:
-
-                    file_name = (
-                        file.get("file_name")
-                        or "Unknown File"
-                    )
-
-                    file_size = (
-                        file.get("file_size_bytes")
-                        or 0
-                    )
-
-                    movie_name = (
-                        file.get("movie_name")
-                        or "Unknown"
-                    )
-
-
-                    if isinstance(
-                        file_size,
-                        (int, float)
-                    ):
-
-                        if file_size >= 1024 ** 3:
-
-                            size_text = (
-                                f"{file_size / (1024 ** 3):.2f} GB"
-                            )
-
-                        elif file_size >= 1024 ** 2:
-
-                            size_text = (
-                                f"{file_size / (1024 ** 2):.2f} MB"
-                            )
-
-                        elif file_size >= 1024:
-
-                            size_text = (
-                                f"{file_size / 1024:.2f} KB"
-                            )
-
-                        else:
-
-                            size_text = (
-                                f"{file_size} B"
-                            )
+                        size_text = (
+                            f"{file_size / 1024:.2f} KB"
+                        )
 
                     else:
 
-                        size_text = str(
-                            file_size
+                        size_text = (
+                            f"{file_size} B"
                         )
 
+                else:
 
-                    username = (
-                        f"@{user.username}"
-                        if user.username
-                        else "No Username"
+                    size_text = str(
+                        file_size
                     )
 
 
-                    asyncio.create_task(
-                        send_log(
-                            f"""
+                username = (
+                    f"@{user.username}"
+                    if user.username
+                    else "No Username"
+                )
+
+
+                asyncio.create_task(
+                    send_log(
+                        f"""
 🔗 <b>FILE LINK CLICKED</b>
 
 👤 <b>User:</b> {user.mention}
@@ -385,193 +383,177 @@ async def start_command(
 
 ⚡ <b>Action:</b> FILE LINK CLICK
 """
-                        )
                     )
-
-                except Exception as e:
-
-                    print(
-                        f"[start] File log warning: {e}",
-                        flush=True
-                    )
-
-
-                # =================================================
-                # Channel information
-                # =================================================
-
-                channel_id = file.get(
-                    "channel_id"
                 )
 
-                message_id = file.get(
-                    "message_id"
+            except Exception as e:
+
+                print(
+                    f"[start] File log warning: {e}",
+                    flush=True
                 )
 
 
-                if not channel_id or not message_id:
+            # =================================================
+            # Channel information
+            # =================================================
 
-                    return await message.reply_text(
-                        "❌ File information is incomplete.",
-                        quote=True
-                    )
+            channel_id = file.get(
+                "channel_id"
+            )
 
-
-                # =================================================
-                # File caption
-                # =================================================
-
-                try:
-                    caption = make_file_caption(
-                        file
-                    )
-
-                except Exception:
-                    caption = None
-
-
-                # =================================================
-                # Copy file to user
-                # =================================================
-
-                try:
-
-                    await client.copy_message(
-                        chat_id=user.id,
-                        from_chat_id=channel_id,
-                        message_id=int(message_id),
-                        caption=caption
-                    )
-
-                    return
-
-                except Exception as e:
-
-                    print(
-                        f"[start] File send error: {e}",
-                        flush=True
-                    )
-
-                    return await message.reply_text(
-                        "❌ Unable to send the file.",
-                        quote=True
-                    )
-
-
-        # ========================================================
-        # NORMAL /START
-        # CONFIG IMAGE ROTATION
-        # ========================================================
-
-        caption = (
-            f"**🎬✨ Hey {user.mention}! 👋\n\n"
-            "✨ Welcome to CinemaVeta 🍿🔥\n\n"
-            "🔍 Search your favorite Movies & Series\n\n"
-            "💭 Just type the movie name and get files instantly** 🚀\n\n"
-        )
-
-
-        # ========================================================
-        # If config list is empty, send text message
-        # ========================================================
-
-        if not START_IMAGES:
-
-            return await message.reply_text(
-                text=caption,
-                reply_markup=start_buttons(),
-                quote=True
+            message_id = file.get(
+                "message_id"
             )
 
 
-        selected_url = random.choice(
-            START_IMAGES
-        )
+            if not channel_id or not message_id:
 
-
-        # ========================================================
-        # 1. Direct Telegram Media Dispatch
-        # ========================================================
-
-        try:
-
-            await message.reply_photo(
-                photo=selected_url,
-                caption=caption,
-                reply_markup=start_buttons(),
-                quote=True
-            )
-
-            print(
-                "⚡ INSTANT CONFIG PHOTO SENT",
-                flush=True
-            )
-
-            return
-
-        except Exception as err:
-
-            print(
-                f"⚠️ Direct link fetch failed ({err}), "
-                f"trying memory stream buffer...",
-                flush=True
-            )
-
-
-        # ========================================================
-        # 2. In-Memory Stream Fallback
-        # ========================================================
-
-        bio = await download_image_stream(
-            selected_url
-        )
-
-
-        if bio:
-
-            bio.seek(0)
-
-            try:
-
-                await message.reply_photo(
-                    photo=bio,
-                    caption=caption,
-                    reply_markup=start_buttons(),
+                return await message.reply_text(
+                    "❌ File information is incomplete.",
                     quote=True
                 )
 
-                print(
-                    "⚡ BUFFER STREAM PHOTO SENT",
-                    flush=True
+
+            # =================================================
+            # File caption
+            # =================================================
+
+            try:
+                caption = make_file_caption(
+                    file
+                )
+
+            except Exception:
+                caption = None
+
+
+            # =================================================
+            # Copy file to user
+            # =================================================
+
+            try:
+
+                await client.copy_message(
+                    chat_id=user.id,
+                    from_chat_id=channel_id,
+                    message_id=int(message_id),
+                    caption=caption
                 )
 
                 return
 
-            except Exception:
-                pass
+            except Exception as e:
+
+                print(
+                    f"[start] File send error: {e}",
+                    flush=True
+                )
+
+                return await message.reply_text(
+                    "❌ Unable to send the file.",
+                    quote=True
+                )
 
 
-        # ========================================================
-        # 3. Text fallback if image loading fails completely
-        # ========================================================
+    # ========================================================
+    # NORMAL /START MESSAGE
+    # ========================================================
 
-        await message.reply_text(
+    caption = (
+        f"**🎬✨ Hey {user.mention}! 👋\n\n"
+        "✨ Welcome to CinemaVeta 🍿🔥\n\n"
+        "🔍 Search your favorite Movies & Series\n\n"
+        "💭 Just type the movie name and get files instantly** 🚀\n\n"
+    )
+
+
+    # ========================================================
+    # If config list is empty, send text message
+    # ========================================================
+
+    if not START_IMAGES:
+
+        return await message.reply_text(
             text=caption,
             reply_markup=start_buttons(),
             quote=True
         )
 
 
-    finally:
+    selected_url = random.choice(
+        START_IMAGES
+    )
 
-        # ========================================================
-        # DELETE LOADING STICKER ONCE RESPONSE IS SENT
-        # ========================================================
 
-        if loading_msg:
+    # ========================================================
+    # 1. Direct Telegram Media Dispatch
+    # ========================================================
 
-            try:
-                await loading_msg.delete()
+    try:
 
-            except Exception:
-                pass
+        await message.reply_photo(
+            photo=selected_url,
+            caption=caption,
+            reply_markup=start_buttons(),
+            quote=True
+        )
+
+        print(
+            "⚡ INSTANT CONFIG PHOTO SENT",
+            flush=True
+        )
+
+        return
+
+    except Exception as err:
+
+        print(
+            f"⚠️ Direct link fetch failed ({err}), "
+            f"trying memory stream buffer...",
+            flush=True
+        )
+
+
+    # ========================================================
+    # 2. In-Memory Stream Fallback
+    # ========================================================
+
+    bio = await download_image_stream(
+        selected_url
+    )
+
+
+    if bio:
+
+        bio.seek(0)
+
+        try:
+
+            await message.reply_photo(
+                photo=bio,
+                caption=caption,
+                reply_markup=start_buttons(),
+                quote=True
+            )
+
+            print(
+                "⚡ BUFFER STREAM PHOTO SENT",
+                flush=True
+            )
+
+            return
+
+        except Exception:
+            pass
+
+
+    # ========================================================
+    # 3. Text fallback if image loading fails completely
+    # ========================================================
+
+    await message.reply_text(
+        text=caption,
+        reply_markup=start_buttons(),
+        quote=True
+    )
