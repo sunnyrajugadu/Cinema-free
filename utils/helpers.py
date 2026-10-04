@@ -86,7 +86,7 @@ async def get_imdb_suggestions(query: str, limit: int = 10):
 
 async def get_imdb_movie_details(query: str, preferred_lang: str = "te"):
     """
-    Fetches high-resolution landscape (16:9) banner image, Title, Year, Rating, Genres, and Runtime.
+    Fetches high-resolution vertical poster image, Title, Year, Rating, Genres, and Runtime.
     Dynamically prioritizes the requested original language (te, en, ta, hi, ml, kn).
     Guaranteed Fallback: If TMDB returns no image, picks from IMDb/OMDB.
     """
@@ -152,40 +152,27 @@ async def get_imdb_movie_details(query: str, preferred_lang: str = "te"):
                 if results:
                     best_item = None
 
-                    # Preference 1: Target language (preferred_lang / en) + landscape backdrop
+                    # Preference 1: Target language (preferred_lang / en) + poster
                     for lang in target_langs:
                         for r in results:
-                            if r.get("original_language") == lang and r.get("backdrop_path"):
+                            if r.get("original_language") == lang and r.get("poster_path"):
                                 best_item = r
                                 break
                         if best_item:
                             break
 
-                    # Preference 2: Target language + poster
+                    # Preference 2: Any matching item with a poster
                     if not best_item:
-                        for lang in target_langs:
-                            for r in results:
-                                if r.get("original_language") == lang:
-                                    best_item = r
-                                    break
-                            if best_item:
-                                break
-
-                    # Preference 3: Any matching item with a backdrop
-                    if not best_item:
-                        best_item = next((r for r in results if r.get("backdrop_path")), results[0])
+                        best_item = next((r for r in results if r.get("poster_path")), results[0])
 
                     title = best_item.get("title") or best_item.get("name") or query.title()
                     release_date = best_item.get("release_date") or best_item.get("first_air_date") or ""
                     year = release_date.split("-")[0] if release_date else extracted_year
                     
-                    backdrop = best_item.get("backdrop_path")
                     poster = best_item.get("poster_path")
 
-                    # Primary: 16:9 Landscape Backdrop; Fallback: High-res Poster
-                    if backdrop:
-                        details["image"] = f"https://image.tmdb.org/t/p/w780{backdrop}"
-                    elif poster:
+                    # Always pick High-res Vertical Poster to avoid white padding / borders
+                    if poster:
                         details["image"] = f"https://image.tmdb.org/t/p/w780{poster}"
                     
                     details["title"] = title
