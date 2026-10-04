@@ -5,7 +5,7 @@ from pyrogram.types import Message
 
 from bot import app, user_app_1
 from config import STORAGE_CHANNEL_ID, OWNER_ID
-from database.models import save_file
+from database.models import files
 from utils.rename import (
     clean_name,
     clean_movie_name,
@@ -210,10 +210,19 @@ async def auto_index(
         }
 
         # ====================================================
-        # SAVE TO DATABASE SILENTLY
+        # ATOMIC DUPLICATE CHECK & SAVE (Like reindex.py)
         # ====================================================
+        
+        await files().update_one(
+            {
+                "file_name": renamed_file,
+                "file_size_bytes": file_size
+            },
+            {
+                "$setOnInsert": data
+            },
+            upsert=True
+        )
 
-        await save_file(data)
-
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"⚠️ Auto Index Error: {e}", flush=True)

@@ -1,6 +1,5 @@
 import asyncio
 import time
-import zlib
 from datetime import datetime
 from pyrogram import raw
 from pyrogram.file_id import FileId, FileUniqueId, FileType, FileUniqueType
@@ -57,6 +56,8 @@ def fast_parse_media(doc, is_video, caption, chat_id, msg_id, msg_date):
     else:
         timestamp = int(time.time())
 
+    file_size = getattr(doc, "size", 0) or 0
+
     data = {
         "file_id": file_id,
         "file_unique_id": file_unique_id,
@@ -67,7 +68,7 @@ def fast_parse_media(doc, is_video, caption, chat_id, msg_id, msg_date):
         "language": "Unknown",
         "quality": "Unknown",
         "audio": "Unknown",
-        "file_size_bytes": getattr(doc, "size", 0) or 0,
+        "file_size_bytes": file_size,
         "file_type": media_type,
         "message_id": msg_id,
         "channel_id": chat_id,
@@ -76,8 +77,16 @@ def fast_parse_media(doc, is_video, caption, chat_id, msg_id, msg_date):
         "updated_at": int(time.time())
     }
 
+    # ============================================================
+    # 🔴 DB DUPLICATE CHECK FIX (Name + Size Exact Match)
+    # Using MongoDB's blazingly fast atomic upsert with the compound index.
+    # It will only insert if BOTH file_name and file_size_bytes don't exist together.
+    # ============================================================
     return UpdateOne(
-        {"file_unique_id": file_unique_id},
+        {
+            "file_name": file_name,
+            "file_size_bytes": file_size
+        },
         {"$setOnInsert": data},
         upsert=True
     )
@@ -94,8 +103,11 @@ async def db_writer_worker(queue, files_collection):
             queue.task_done()
             break
         try:
+            # unordered=False allows MongoDB to process the batch concurrently.
             await files_collection.bulk_write(batch, ordered=False)
         except BulkWriteError:
+            # BulkWriteError will catch duplicate key errors if any slip through,
+            # ignoring them and letting valid ones pass.
             pass
         except Exception:
             pass
@@ -109,7 +121,7 @@ async def db_writer_worker(queue, files_collection):
 
 async def fetch_range_worker(client, peer, start_id, end_id, queue, stats):
     offset_id = end_id  # Start from newer message and go backwards towards start_id
-    LIMIT = 500  # Increased limit for faster batch retrieval
+    LIMIT = 500  # Batch retrieval limit
 
     while offset_id >= start_id:
         try:
@@ -157,11 +169,24 @@ async def fetch_range_worker(client, peer, start_id, end_id, queue, stats):
             if not doc:
                 continue
 
-            sig = zlib.crc32(f"{doc.id}:{getattr(doc, 'size', 0)}".encode("utf-8"))
-            if sig in stats["batch_seen"]:
+            # ============================================================
+            # 🔴 IN-MEMORY DUPLICATE CHECK (Name + Size Exact Match)
+            # Extremely fast RAM check. Removes the slow DB find_one bottleneck.
+            # ============================================================
+            temp_file_name = ""
+            for attr in getattr(doc, "attributes", []):
+                if isinstance(attr, raw.types.DocumentAttributeFilename):
+                    temp_file_name = attr.file_name
+            
+            temp_file_size = getattr(doc, 'size', 0) or 0
+            
+            exact_match_key = f"{temp_file_name}::{temp_file_size}"
+            
+            if exact_match_key in stats["batch_seen"]:
                 stats["skipped_duplicates"] += 1
                 continue
-            stats["batch_seen"].add(sig)
+            
+            stats["batch_seen"].add(exact_match_key)
 
             caption = getattr(msg, "message", "")
             msg_date = getattr(msg, "date", None)
@@ -171,7 +196,7 @@ async def fetch_range_worker(client, peer, start_id, end_id, queue, stats):
                 current_batch.append(op)
                 stats["count"] += 1
 
-            if len(current_batch) >= 3000:  # Increased batch threshold for blazing speed
+            if len(current_batch) >= 3000:  # Kept at 3000 for maximum throughput speed
                 await queue.put(list(current_batch))
                 current_batch.clear()
 
@@ -286,7 +311,7 @@ async def reindex_channel(status_message=None):
                     await status_message.edit_text(
                         f"⚡ <b>Ultra-Optimized 2-Session Reindex running...</b>\n\n"
                         f"📁 Total Indexed: <code>{stats['count']:,}</code>\n"
-                        f"⚠️ Duplicates: <code>{stats['skipped_duplicates']:,}</code>\n"
+                        f"⚠️ RAM Duplicates Skipped: <code>{stats['skipped_duplicates']:,}</code>\n"
                         f"⏱ Elapsed: <code>{elapsed}s</code>\n"
                         f"🚀 Speed: <code>~{rate:,} files/s</code>"
                     )
@@ -313,7 +338,7 @@ async def reindex_channel(status_message=None):
     final_text = (
         f"✅ <b>Ultra-Optimized 2-Session Reindex Finished!</b> ⚡\n\n"
         f"📁 <b>Total Indexed:</b> <code>{stats['count']:,}</code>\n"
-        f"⚠️ <b>Duplicates Filtered:</b> <code>{stats['skipped_duplicates']:,}</code>\n"
+        f"⚠️ <b>RAM Duplicates Filtered:</b> <code>{stats['skipped_duplicates']:,}</code>\n"
         f"⏱ <b>Time Taken:</b> <code>{total_time}s</code>\n"
         f"🚀 <b>Throughput:</b> <code>~{avg_speed:,} files/sec</code>"
     )
