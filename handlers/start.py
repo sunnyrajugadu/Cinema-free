@@ -27,7 +27,6 @@ print(
     flush=True
 )
 
-LOADING_STICKER_ID = "CAACAgUAAxkBAAEHWkpqv3WmNi1J-_G5FNLI0I00Lq80BwACBAADwSQxMYnlHW4Ls8gQPQQ"
 
 HTTP_HEADERS = {
     "User-Agent": (
@@ -158,7 +157,7 @@ async def start_command(
                     )
                 else:
                     print(
-                        f"⚠️️ START REACTION FAILED: {result}",
+                        f"⚠ START REACTION FAILED: {result}",
                         flush=True
                     )
 
@@ -168,24 +167,8 @@ async def start_command(
             flush=True
         )
 
-    # Reaction సెండ్ అయిన తర్వాత చిన్న గ్యాప్ (delay)
-    await asyncio.sleep(0.6)
-
-
-    # ========================================================
-    # 2. SEND STICKER AFTER REACTION
-    # ========================================================
-
-    try:
-        await message.reply_sticker(
-            LOADING_STICKER_ID,
-            quote=True
-        )
-    except Exception:
-        pass
-        
-    # Sticker సెండ్ అయిన తర్వాత మళ్ళీ చిన్న గ్యాప్
-    await asyncio.sleep(0.6)
+    # Reaction motham pop up avvadaniki 1.5 seconds delay
+    await asyncio.sleep(1.5)
 
 
     # ====================================================
