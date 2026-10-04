@@ -31,6 +31,8 @@ print("✅ search.py imported", flush=True)
 
 # ================= SETTINGS ================= #
 
+MENU_EXPIRE_SECONDS = 300
+
 PAGE_LIMIT = 7
 
 FIXED_LANGUAGES = [
@@ -160,7 +162,7 @@ def clean_movie_base_title(raw_name: str, query: str = "") -> str:
     # 4. Strip languages from tail
     title = re.sub(r"\b(telugu|tamil|hindi|english|malayalam|kannada|multi|dual\s*audio)\b", "", title, flags=re.IGNORECASE)
 
-    # 5. Clean trailing isolated letters/tags (e.g., 'H', 'X', 'X2', 'Aa', 'He', 'V1')
+    # 5. Clean trailing isolated letters/tags
     title = re.sub(r"\b(h|x|x2|aa|he|v1|v2|org|hq)\b", "", title, flags=re.IGNORECASE)
 
     # 6. Normalize punctuation and spaces
@@ -184,7 +186,6 @@ def extract_distinct_movies(files_list, search_query: str):
         if clean and len(clean) >= 3 and query_norm in clean.lower():
             raw_titles.append(clean)
 
-    # Group similar titles into root names
     distinct = []
     for cand in sorted(raw_titles, key=len):
         cand_lower = cand.lower().strip()
@@ -258,6 +259,19 @@ async def auto_delete_message(message, delay_seconds: int = 40):
     try:
         await asyncio.sleep(delay_seconds)
         await message.delete()
+    except Exception:
+        pass
+
+
+# ================= AUTO DELETE MENU AFTER EXPIRY ================= #
+
+async def auto_delete_menu(client, chat_id, message_id):
+    try:
+        await asyncio.sleep(MENU_EXPIRE_SECONDS)
+        await client.delete_messages(
+            chat_id=chat_id,
+            message_ids=message_id
+        )
     except Exception:
         pass
 
@@ -440,7 +454,6 @@ async def execute_search(
 
         # ================= NO RESULTS / SPELLING SUGGESTIONS ================= #
         if not results:
-            # 1. First check for spelling mistakes using IMDb suggestions
             if allow_spelling_suggestions:
                 suggestions = await get_imdb_suggestions(movie_name, limit=8)
                 if suggestions:
@@ -469,7 +482,6 @@ async def execute_search(
                         asyncio.create_task(auto_delete_message(spell_msg, delay_seconds=30))
                     return
 
-            # 2. Pure No Results: Display the requested prompt & buttons
             google_query = urllib.parse.quote_plus(movie_name)
             google_search_url = f"https://www.google.com/search?q={google_query}"
 
@@ -484,7 +496,7 @@ async def execute_search(
                     InlineKeyboardButton("‼️ INSTRUCTIONS ‼️", callback_data="search_instructions")
                 ],
                 [
-                    InlineKeyboardButton("♻️ GOOGLE SEARCH ♻️", url=google_search_url)
+                    InlineKeyboardButton("♻️️ GOOGLE SEARCH ♻️", url=google_search_url)
                 ]
             ]
 
@@ -507,7 +519,6 @@ async def execute_search(
         user_name = user.first_name or "User"
         user_mention = f'<a href="tg://user?id={user.id}"><b>{html.escape(user_name)}</b></a>'
 
-        # Detect audio languages
         detected_audios = set()
         for f in results:
             langs = extract_file_languages(f)
@@ -521,18 +532,15 @@ async def execute_search(
 
         audio_str = ", ".join(sorted_audios) if sorted_audios else "Multi"
 
-        # Dynamically determine original language for TMDB
         target_lang = "te"
         for l in sorted_audios:
             if l in TMDB_LANG_MAP:
                 target_lang = TMDB_LANG_MAP[l]
                 break
 
-        # Fetch Landscape Movie Banner & Details from TMDB
         movie_details = await get_imdb_movie_details(movie_name, preferred_lang=target_lang)
         landscape_banner_url = movie_details.get("image") if movie_details else None
 
-        # Direct IMDb Movie Details Caption
         caption_lines = []
 
         if movie_details and movie_details.get("title"):
@@ -619,9 +627,11 @@ async def execute_search(
 
         # ================= DISPATCH PHOTO BANNER ================= #
         sent_success = False
+        sent_message = None
+        
         if landscape_banner_url:
             try:
-                await client.send_photo(
+                sent_message = await client.send_photo(
                     chat_id=chat_id,
                     photo=landscape_banner_url,
                     caption=final_caption,
@@ -636,7 +646,7 @@ async def execute_search(
                         async with session.get(landscape_banner_url, timeout=aiohttp.ClientTimeout(total=4)) as img_resp:
                             if img_resp.status == 200:
                                 img_bytes = await img_resp.read()
-                                await client.send_photo(
+                                sent_message = await client.send_photo(
                                     chat_id=chat_id,
                                     photo=img_bytes,
                                     caption=final_caption,
@@ -648,11 +658,23 @@ async def execute_search(
                     print(f"⚠️ Stream fallback error: {b_err}", flush=True)
 
         if not sent_success:
-            await client.send_message(
+            sent_message = await client.send_message(
                 chat_id=chat_id,
                 text=final_caption,
                 reply_markup=reply_markup,
                 reply_to_message_id=reply_to_message_id
+            )
+
+        # ====================================================
+        # AUTO DELETE SEARCH MENU TASK
+        # ====================================================
+        if sent_message:
+            asyncio.create_task(
+                auto_delete_menu(
+                    client=client,
+                    chat_id=chat_id,
+                    message_id=sent_message.id
+                )
             )
 
         print("✅ SEARCH RESULT SENT SUCCESSFULLY", flush=True)
@@ -660,7 +682,7 @@ async def execute_search(
     except Exception as e:
         print(f"❌ SEARCH ERROR : {e}", flush=True)
         try:
-            await client.send_message(chat_id, "⚠️ Something went wrong.", reply_to_message_id=reply_to_message_id)
+            await client.send_message(chat_id, "⚠️️ Something went wrong.", reply_to_message_id=reply_to_message_id)
         except Exception:
             pass
 
