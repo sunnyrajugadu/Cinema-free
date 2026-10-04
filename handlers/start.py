@@ -97,7 +97,24 @@ async def start_command(
     if not user:
         return
 
-    # 1. SEND LOADING STICKER IMMEDIATELY
+
+    # 1. REACTION TO START COMMAND 
+
+    try:
+        await client.send_reaction(
+            chat_id=message.chat.id,
+            message_id=message.id,
+            emoji="💋"
+        )
+    except Exception:
+        try:
+            await message.react("💋")
+        except Exception:
+            pass
+
+    
+
+    # 2. SEND LOADING STICKER IMMEDIATELY
     loading_msg = None
     try:
         loading_msg = await message.reply_sticker(LOADING_STICKER_ID, quote=True)
