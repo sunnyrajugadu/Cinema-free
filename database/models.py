@@ -40,12 +40,22 @@ async def init_db_indexes():
 
     tasks = [
         # Files indexes
-        files_col.create_index("file_unique_id", unique=True, background=True),
+        # Exact duplicate identity is filename + byte size.
+        files_col.create_index("file_unique_id", background=True),
         files_col.create_index("movie_name", background=True),
         files_col.create_index("file_name", background=True),
         
         # 🔴 ADDED: Compound Index for lightning-fast duplicate checking
-        files_col.create_index([("file_name", 1), ("file_size_bytes", 1)], background=True),
+        files_col.create_index(
+            [("file_name", 1), ("file_size_bytes", 1)],
+            unique=True,
+            partialFilterExpression={
+                "file_name": {"$exists": True},
+                "file_size_bytes": {"$exists": True}
+            },
+            background=True,
+            name="file_name_size_unique"
+        ),
         
         files_col.create_index([("indexed_at", -1)], background=True),
         files_col.create_index([("updated_at", -1)], background=True),

@@ -1,6 +1,7 @@
 import html
 import json
 import re
+
 from urllib.parse import quote_plus
 
 import aiohttp
@@ -9,6 +10,7 @@ from pyrogram.types import Message, CallbackQuery, InlineKeyboardButton, InlineK
 
 from bot import app
 from utils.helpers import normalize_text
+from utils.imdb_banner import create_imdb_banner
 
 
 print("✅ handlers/imdb.py imported (IMDb Full Metadata Fix)", flush=True)
@@ -346,10 +348,6 @@ def format_release_date(value, fallback_year=None):
 
 
 def poster_high_res(url):
-    # Keep IMDb's original poster URL exactly as provided.
-    # Do not force _V1_UY1200_CR0,0,800,1200_AL_.jpg because that
-    # can introduce white side edges/cropping compared with IMDb's
-    # original poster image.
     return url if url else None
 
 
@@ -384,7 +382,6 @@ def names_from_json_value(value):
 
     def walk(item):
         if isinstance(item, str):
-            # Avoid treating generic labels as people.
             if item.strip():
                 result.append(item.strip())
         elif isinstance(item, dict):
@@ -411,7 +408,6 @@ def country_names(value):
             if item.strip():
                 result.append(item.strip())
         elif isinstance(item, dict):
-            # JSON-LD countryOfOrigin may be {name: "India"}.
             for key in ("name", "text", "country"):
                 val = item.get(key)
                 if isinstance(val, str) and val.strip():
@@ -462,13 +458,6 @@ TMDB_KEY = "7f43669a428c09611a0518fa9c0bbddb"
 
 
 async def fetch_tmdb_cbfc_certificate(imdb_id, title=None, year=None):
-    """Fetch the India/CBFC certificate from TMDB using the IMDb ID.
-
-    TMDB maps the IMDb ID to its own movie ID through /find, then exposes
-    country-specific certifications through /movie/{id}/release_dates.
-    Only the India (IN) release certification is used here so the rest of
-    the IMDb metadata remains untouched.
-    """
     if not imdb_id:
         return None
 
@@ -483,14 +472,9 @@ async def fetch_tmdb_cbfc_certificate(imdb_id, title=None, year=None):
 
     try:
         async with aiohttp.ClientSession(timeout=HTTP_TIMEOUT, headers=headers) as session:
-            # 1) IMDb ID -> TMDB movie ID
             find_url = f"{TMDB_API_URL}/find/{imdb_id}"
             async with session.get(find_url, params=params) as response:
                 if response.status != 200:
-                    print(
-                        f"TMDB Find Certificate HTTP {response.status} [{imdb_id}]",
-                        flush=True,
-                    )
                     return None
                 find_data = await response.json(content_type=None)
 
@@ -498,8 +482,6 @@ async def fetch_tmdb_cbfc_certificate(imdb_id, title=None, year=None):
             if not movie_results:
                 return None
 
-            # Prefer a result whose title/year agrees with IMDb when there are
-            # multiple matches; otherwise use the first TMDB movie result.
             selected = None
             target_title = str(title or "").strip().casefold()
             target_year = str(year or "").strip()
@@ -526,17 +508,12 @@ async def fetch_tmdb_cbfc_certificate(imdb_id, title=None, year=None):
             if not tmdb_movie_id:
                 return None
 
-            # 2) TMDB movie -> regional release dates/certifications
             release_url = f"{TMDB_API_URL}/movie/{tmdb_movie_id}/release_dates"
             async with session.get(
                 release_url,
                 params={"api_key": TMDB_KEY},
             ) as response:
                 if response.status != 200:
-                    print(
-                        f"TMDB Release Dates HTTP {response.status} [{imdb_id}/{tmdb_movie_id}]",
-                        flush=True,
-                    )
                     return None
                 release_data = await response.json(content_type=None)
 
@@ -555,10 +532,6 @@ async def fetch_tmdb_cbfc_certificate(imdb_id, title=None, year=None):
         if not release_entries:
             return None
 
-        # TMDB release-date types:
-        # 1 = Premiere, 2 = Theatrical (limited), 3 = Theatrical,
-        # 4 = Digital, 5 = Physical, 6 = TV.
-        # For a CBFC certificate, theatrical entries are the useful ones.
         type_priority = {3: 0, 2: 1, 1: 2, 4: 3, 5: 4, 6: 5}
         candidates = []
 
@@ -583,9 +556,6 @@ async def fetch_tmdb_cbfc_certificate(imdb_id, title=None, year=None):
         if not candidates:
             return None
 
-        # Prefer theatrical certification, then the most recent entry within
-        # that type. This also handles TMDB entries that contain multiple
-        # Indian release records for the same movie.
         candidates.sort(key=lambda item: (item[0], item[1]), reverse=False)
         best_priority = candidates[0][0]
         same_priority = [item for item in candidates if item[0] == best_priority]
@@ -628,9 +598,7 @@ def extract_title_from_jsonld(blocks):
 
 
 def extract_jsonld_details(blocks):
-    """Extract the stable schema.org fields IMDb publishes on title pages."""
     out = {}
-
     for block in blocks:
         items = block if isinstance(block, list) else [block]
         for item in items:
@@ -999,12 +967,6 @@ async def fetch_full_movie_details(
         "trailer_url": None,
     }
 
-    # IMDb's __NEXT_DATA__ is the key source for the fields that were N/A.
-    # In particular:
-    # mainColumnData.principalCredits -> directors
-    # mainColumnData.spokenLanguages -> languages
-    # mainColumnData.countriesDetails -> countries
-    # mainColumnData.akas -> alternate titles
     try:
         page = await fetch_imdb_title_page(imdb_id)
         jsonld_blocks = parse_json_ld_scripts(page)
@@ -1041,7 +1003,6 @@ async def fetch_full_movie_details(
             if certificate:
                 data["certificate"] = clean_text(certificate, "") or None
 
-        # JSON-LD fallback for credits, languages, countries and alternate names.
         if not data["director"] and jsonld.get("director"):
             data["director"] = extract_jsonld_people(jsonld.get("director"))
         if not data["languages"] and jsonld.get("inLanguage"):
@@ -1070,8 +1031,6 @@ async def fetch_full_movie_details(
             if not isinstance(main, dict):
                 main = {}
 
-            # IMDb occasionally moves these objects in its page payload.
-            # Keep the exact current paths first, then use recursive fallbacks.
             principal_payload = main.get("principalCredits")
             if not principal_payload:
                 principal_payload = deep_find(next_data, ["principalCredits"]) or []
@@ -1181,8 +1140,6 @@ async def fetch_full_movie_details(
     except Exception as exc:
         print(f"IMDb Title Page Error [{imdb_id}]: {exc}", flush=True)
 
-    # Small GraphQL fallback for core fields. It is deliberately kept separate
-    # so an unsupported optional field cannot wipe out all metadata.
     try:
         core = await fetch_imdb_core_graphql(imdb_id)
         if core:
@@ -1234,8 +1191,6 @@ async def fetch_full_movie_details(
     data["aka"] = data["aka"] or []
     data["poster"] = data["poster"] or None
 
-    # Final metadata fallback. These fields are queried independently from IMDb
-    # so a missing optional field can never erase the fields already collected.
     extended = await fetch_imdb_extended_graphql(imdb_id)
     if extended:
         certificate_text = first_text(extended.get("certificate"))
@@ -1294,9 +1249,6 @@ async def fetch_full_movie_details(
                     aka_values.append(text)
             data["aka"] = unique_strings(aka_values)[:8]
 
-    # IMDb sometimes leaves certificate empty/generic. Fetch ONLY the India
-    # CBFC certificate from TMDB; every other field remains exactly as collected
-    # above from IMDb. If TMDB cannot provide it, keep the IMDb value.
     try:
         tmdb_certificate = await fetch_tmdb_cbfc_certificate(
             imdb_id,
@@ -1308,8 +1260,6 @@ async def fetch_full_movie_details(
     except Exception as exc:
         print(f"TMDB CBFC Certificate Fallback Error [{imdb_id}]: {exc}", flush=True)
 
-    # Do not print the literal N/A for these fields. IMDb can genuinely omit
-    # metadata for some titles, so use a neutral label only as a last resort.
     data["director"] = data["director"] or [{"name": "Not Available", "id": None}]
     data["languages"] = data["languages"] or ["Not Available"]
     data["countries"] = data["countries"] or ["Not Available"]
@@ -1317,7 +1267,6 @@ async def fetch_full_movie_details(
     trailer_query = quote_plus(f"{data['title']} {data['year']} official trailer")
     data["trailer_url"] = f"https://www.youtube.com/results?search_query={trailer_query}"
     return data
-
 
 # ============================================================
 # /imdb command
@@ -1351,7 +1300,6 @@ async def imdb_search_command(client, message: Message):
         buttons = []
         for item in results:
             btn_text = f"{item['title']} - {item['year']}"
-            # IMPORTANT: only IMDb ID. No 64-byte truncation.
             buttons.append([
                 InlineKeyboardButton(
                     text=btn_text[:64],
@@ -1401,6 +1349,13 @@ async def imdb_view_callback(client, query: CallbackQuery):
             await query.message.delete()
         except Exception:
             pass
+
+        # ADDED: "Generating..." message 
+        gen_msg = await client.send_message(
+            chat_id=orig_message.chat.id,
+            text="🔄 <b>Generating...</b>",
+            reply_to_message_id=orig_message.id
+        )
 
         info = await fetch_full_movie_details(imdb_id)
 
@@ -1460,7 +1415,7 @@ async def imdb_view_callback(client, query: CallbackQuery):
         caption_lines.extend([
             f"⭐ <b>IMDb Rating :</b> {rating_disp}{vote_disp}",
             f"🔞 <b>Certificate :</b> "
-            f"{html.escape(str(info['certificate']))}",
+            f"{html.escape(normalize_certificate(info.get('certificate')) or 'Not Available')}",
             f"🗓 <b>Release Info :</b> "
             f"{html.escape(str(info['release_date']) if info['release_date'] != 'N/A' else 'Not Available')}",
             f"⏳ <b>Runtime :</b> {html.escape(str(info['runtime']) if info['runtime'] != 'N/A' else 'Not Available')}",
@@ -1523,7 +1478,33 @@ async def imdb_view_callback(client, query: CallbackQuery):
 
         sent = False
 
-        if info.get("poster"):
+        try:
+            banner = await create_imdb_banner(info)
+            
+            # Auto delete generating message before sending photo
+            try:
+                await gen_msg.delete()
+            except Exception:
+                pass
+                
+            await client.send_photo(
+                chat_id=orig_message.chat.id,
+                photo=banner,
+                caption=final_caption,
+                reply_markup=reply_markup,
+                reply_to_message_id=orig_message.id,
+            )
+            sent = True
+        except Exception as banner_error:
+            print(f"IMDb Custom Banner Error: {banner_error}", flush=True)
+
+        if not sent and info.get("poster"):
+            # Also auto-delete if banner fails but it sends normal poster
+            try:
+                await gen_msg.delete()
+            except Exception:
+                pass
+                
             try:
                 await client.send_photo(
                     chat_id=orig_message.chat.id,
@@ -1537,6 +1518,11 @@ async def imdb_view_callback(client, query: CallbackQuery):
                 print(f"IMDb Photo Send Error: {photo_error}", flush=True)
 
         if not sent:
+            try:
+                await gen_msg.delete()
+            except Exception:
+                pass
+            
             await client.send_message(
                 chat_id=orig_message.chat.id,
                 text=final_caption,
