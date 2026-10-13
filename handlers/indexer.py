@@ -271,7 +271,7 @@ async def external_dump_handler(client, message: Message):
             f"🎉 <b>Channel Dump & Sync Successfully Completed!</b>\n\n"
             f"📂 <b>Target Channel :</b> <code>{target_title}</code>\n"
             f"🔍 <b>Total Messages Scanned :</b> <code>{total_scanned}</code>\n"
-            f"📥 <b>Successfully Copied :</b> <code>{total_copied}</code>\n"
+            f"✅ <b>Successfully Copied :</b> <code>{total_copied}</code>\n"
             f"✅ <b>Synced to MongoDB :</b> <code>{total_saved}</code>\n"
             f"⚠️ <b>Skipped / Failed :</b> <code>{skipped_count}</code>\n"
             f"⏱ <b>Total Time Taken :</b> <code>{elapsed_total}s</code>"
