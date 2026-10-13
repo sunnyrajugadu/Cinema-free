@@ -33,6 +33,107 @@ is_owner_filter = filters.create(owner_check)
 
 
 # ============================================================
+# CORE DATABASE SAVING LOGIC (GUARANTEED INDEXING)
+# ============================================================
+
+async def save_file_to_db(message: Message):
+    """Extracts metadata and saves the exact Bot message to MongoDB"""
+    media = message.document or message.video
+    if not media:
+        return False
+
+    original_name = getattr(media, "file_name", None) or "Unknown"
+    caption = str(getattr(message, "caption", "") or "").strip()
+    cleaned_name = clean_name(original_name) or original_name
+    metadata = extract_metadata(original_name, caption)
+
+    movie_name = metadata.get("movie_name", "")
+    year = metadata.get("year", "Unknown")
+    languages = metadata.get("languages", [])
+    quality = metadata.get("quality", "Unknown")
+    audio = metadata.get("audio", "Unknown")
+
+    detected_set = set()
+
+    if isinstance(languages, list):
+        for l in languages:
+            if l and str(l).lower() != "unknown":
+                detected_set.add(str(l).strip())
+    elif isinstance(languages, str) and languages.lower() != "unknown":
+        for l in languages.split("+"):
+            if l.strip():
+                detected_set.add(l.strip())
+
+    for text_source in (original_name, caption):
+        if text_source:
+            for lang in detect_languages(text_source):
+                if lang and lang.lower() != "unknown":
+                    detected_set.add(lang)
+
+    final_languages = list(detected_set) if detected_set else ["Unknown"]
+
+    if not movie_name:
+        movie_name = cleaned_name or original_name
+    if not year:
+        year = "Unknown"
+    if not quality:
+        quality = "Unknown"
+    if not audio:
+        audio = "Unknown"
+
+    movie_name = clean_movie_name(movie_name) or cleaned_name or original_name
+
+    extension = ""
+    if "." in original_name:
+        extension = "." + original_name.rsplit(".", 1)[-1]
+
+    renamed_file = rename_movie_file(cleaned_name, "", extension)
+
+    for lang in detect_languages(renamed_file):
+        if lang and lang.lower() != "unknown" and lang not in final_languages:
+            if "Unknown" in final_languages:
+                final_languages.remove("Unknown")
+            final_languages.append(lang)
+
+    file_size = getattr(media, "file_size", 0) or 0
+    msg_date = getattr(message, "date", None)
+    timestamp = int(msg_date.timestamp()) if msg_date else int(time.time())
+
+    data = {
+        "file_id": media.file_id,
+        "file_unique_id": media.file_unique_id,
+        "file_name": renamed_file,
+        "movie_name": movie_name,
+        "year": year,
+        "languages": final_languages,
+        "language": " + ".join(final_languages) if final_languages != ["Unknown"] else "Unknown",
+        "quality": quality,
+        "audio": audio,
+        "original_file_name": original_name,
+        "caption": caption,
+        "file_size_bytes": file_size,
+        "file_type": "video" if message.video else "document",
+        "message_id": message.id,
+        "channel_id": message.chat.id,
+        "indexed_at": timestamp,
+        "updated_at": int(time.time())
+    }
+    
+    # Using $set ensures that even if the file exists, the new file_id updates the database
+    await files().update_one(
+        {
+            "file_name": renamed_file,
+            "file_size_bytes": file_size
+        },
+        {
+            "$set": data
+        },
+        upsert=True
+    )
+    return True
+
+
+# ============================================================
 # MANUAL REINDEX COMMAND (OWNER ONLY)
 # ============================================================
 
@@ -57,7 +158,7 @@ async def manual_reindex_handler(client, message: Message):
 
 
 # ============================================================
-# EXTERNAL CHANNEL DUMP COMMAND (OWNER ONLY - TURBO MODE)
+# EXTERNAL CHANNEL DUMP COMMAND (OWNER ONLY - TURBO MODE & DB SYNC)
 # ============================================================
 
 is_dumping = False
@@ -108,12 +209,13 @@ async def external_dump_handler(client, message: Message):
     is_dumping = True
     total_scanned = 0
     total_copied = 0
+    total_saved = 0
     skipped_count = 0
     start_time = time.time()
 
     await status_msg.edit_text(
         f"🚀 <b>Starting full dump from :</b> <code>{target_title}</code>\n"
-        f"<i>Scanning all files from the channel history...</i>"
+        f"<i>Scanning files and syncing directly to MongoDB...</i>"
     )
 
     try:
@@ -126,7 +228,17 @@ async def external_dump_handler(client, message: Message):
             copied_successfully = False
             while not copied_successfully:
                 try:
-                    await msg.copy(chat_id=STORAGE_CHANNEL_ID)
+                    # 1. User session copies file to storage
+                    copied_msg = await msg.copy(chat_id=STORAGE_CHANNEL_ID)
+                    
+                    # 2. Bot fetches the copied message to get valid bot file_id
+                    bot_msg = await app.get_messages(STORAGE_CHANNEL_ID, copied_msg.id)
+                    if bot_msg:
+                        # 3. Direct DB Sync using the new save_file_to_db function
+                        saved = await save_file_to_db(bot_msg)
+                        if saved:
+                            total_saved += 1
+
                     total_copied += 1
                     copied_successfully = True
                     await asyncio.sleep(0.2)  # Turbo mode delay
@@ -138,15 +250,16 @@ async def external_dump_handler(client, message: Message):
                     skipped_count += 1
                     break
 
-            # Update status message every 50 copied items (saves execution time)
+            # Update status message every 50 copied items
             if total_copied > 0 and total_copied % 50 == 0:
                 elapsed = int(time.time() - start_time)
                 try:
                     await status_msg.edit_text(
-                        f"⚡ <b>Dumping In Progress (Turbo Mode)...</b>\n\n"
+                        f"⚡ <b>Dumping & DB Syncing In Progress...</b>\n\n"
                         f"📂 <b>Target Channel :</b> <code>{target_title}</code>\n"
                         f"🔍 <b>Total Scanned :</b> <code>{total_scanned}</code>\n"
-                        f"✅ <b>Copied & Indexed :</b> <code>{total_copied}</code>\n"
+                        f"📥 <b>Copied Files :</b> <code>{total_copied}</code>\n"
+                        f"✅ <b>Saved to MongoDB :</b> <code>{total_saved}</code>\n"
                         f"⚠️ <b>Skipped / Failed :</b> <code>{skipped_count}</code>\n"
                         f"⏱ <b>Elapsed Time :</b> <code>{elapsed}s</code>"
                     )
@@ -155,10 +268,11 @@ async def external_dump_handler(client, message: Message):
 
         elapsed_total = int(time.time() - start_time)
         await status_msg.edit_text(
-            f"🎉 <b>Channel Dump Successfully Completed!</b>\n\n"
+            f"🎉 <b>Channel Dump & Sync Successfully Completed!</b>\n\n"
             f"📂 <b>Target Channel :</b> <code>{target_title}</code>\n"
             f"🔍 <b>Total Messages Scanned :</b> <code>{total_scanned}</code>\n"
-            f"✅ <b>Successfully Copied & Saved :</b> <code>{total_copied}</code>\n"
+            f"📥 <b>Successfully Copied :</b> <code>{total_copied}</code>\n"
+            f"✅ <b>Synced to MongoDB :</b> <code>{total_saved}</code>\n"
             f"⚠️ <b>Skipped / Failed :</b> <code>{skipped_count}</code>\n"
             f"⏱ <b>Total Time Taken :</b> <code>{elapsed_total}s</code>"
         )
@@ -182,6 +296,7 @@ async def auto_index(
     client,
     message: Message
 ):
+    """Catches any manual uploads forwarded to the storage channel and saves them."""
     try:
         # ====================================================
         # ENSURE USER SESSION IS CONNECTED FOR REAL-TIME FETCHING
@@ -189,155 +304,8 @@ async def auto_index(
         if user_app_1 and not user_app_1.is_connected:
             await user_app_1.start()
 
-        # ====================================================
-        # GET MEDIA
-        # ====================================================
-
-        media = message.document or message.video
-        if not media:
-            return
-
-        # ====================================================
-        # ORIGINAL FILE NAME
-        # ====================================================
-
-        original_name = getattr(media, "file_name", None) or "Unknown"
-
-        # ====================================================
-        # CAPTION
-        # ====================================================
-
-        caption = str(getattr(message, "caption", "") or "").strip()
-
-        # ====================================================
-        # CLEAN ORIGINAL NAME
-        # ====================================================
-
-        cleaned_name = clean_name(original_name) or original_name
-
-        # ====================================================
-        # EXTRACT ALL METADATA
-        # ====================================================
-
-        metadata = extract_metadata(original_name, caption)
-
-        movie_name = metadata.get("movie_name", "")
-        year = metadata.get("year", "Unknown")
-        languages = metadata.get("languages", [])
-        quality = metadata.get("quality", "Unknown")
-        audio = metadata.get("audio", "Unknown")
-
-        # ====================================================
-        # ADVANCED MULTI-LANGUAGE RESOLVER
-        # ====================================================
-
-        detected_set = set()
-
-        if isinstance(languages, list):
-            for l in languages:
-                if l and str(l).lower() != "unknown":
-                    detected_set.add(str(l).strip())
-        elif isinstance(languages, str) and languages.lower() != "unknown":
-            for l in languages.split("+"):
-                if l.strip():
-                    detected_set.add(l.strip())
-
-        for text_source in (original_name, caption):
-            if text_source:
-                for lang in detect_languages(text_source):
-                    if lang and lang.lower() != "unknown":
-                        detected_set.add(lang)
-
-        final_languages = list(detected_set) if detected_set else ["Unknown"]
-
-        # ====================================================
-        # SAFETY NORMALIZATION
-        # ====================================================
-
-        if not movie_name:
-            movie_name = cleaned_name or original_name
-
-        if not year:
-            year = "Unknown"
-
-        if not quality:
-            quality = "Unknown"
-
-        if not audio:
-            audio = "Unknown"
-
-        # ====================================================
-        # FINAL MOVIE NAME CLEAN
-        # ====================================================
-
-        movie_name = clean_movie_name(movie_name) or cleaned_name or original_name
-
-        # ====================================================
-        # FILE EXTENSION
-        # ====================================================
-
-        extension = ""
-        if "." in original_name:
-            extension = "." + original_name.rsplit(".", 1)[-1]
-
-        # ====================================================
-        # FINAL RENAMED FILE
-        # ====================================================
-
-        renamed_file = rename_movie_file(cleaned_name, "", extension)
-
-        for lang in detect_languages(renamed_file):
-            if lang and lang.lower() != "unknown" and lang not in final_languages:
-                if "Unknown" in final_languages:
-                    final_languages.remove("Unknown")
-                final_languages.append(lang)
-
-        # ====================================================
-        # FILE SIZE & TIMESTAMPS
-        # ====================================================
-
-        file_size = getattr(media, "file_size", 0) or 0
-        msg_date = getattr(message, "date", None)
-        timestamp = int(msg_date.timestamp()) if msg_date else int(time.time())
-
-        # ====================================================
-        # FILE DATA
-        # ====================================================
-
-        data = {
-            "file_id": media.file_id,
-            "file_unique_id": media.file_unique_id,
-            "file_name": renamed_file,
-            "movie_name": movie_name,
-            "year": year,
-            "languages": final_languages,
-            "language": " + ".join(final_languages) if final_languages != ["Unknown"] else "Unknown",
-            "quality": quality,
-            "audio": audio,
-            "original_file_name": original_name,
-            "caption": caption,
-            "file_size_bytes": file_size,
-            "file_type": "video" if message.video else "document",
-            "message_id": message.id,
-            "channel_id": message.chat.id,
-            "indexed_at": timestamp,
-            "updated_at": int(time.time())
-        }
-
-        # ====================================================
-        # ATOMIC DUPLICATE CHECK & SAVE (Like reindex.py)
-        # ====================================================
-        
-        await files().update_one(
-            {
-                "file_name": renamed_file,
-                "file_size_bytes": file_size
-            },
-            {
-                "$setOnInsert": data
-            },
-            upsert=True
-        )
+        # Reuses the core logic function to avoid code duplication
+        await save_file_to_db(message)
 
     except Exception as e:
         print(f"⚠️ Auto Index Error: {e}", flush=True)
