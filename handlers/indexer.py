@@ -242,7 +242,16 @@ async def external_dump_handler(client, message: Message):
     status_msg = await message.reply_text(f"🔍 <b>Connecting to target channel:</b> <code>{target_raw}</code>...")
 
     try:
-        target_entity = await user_app_1.get_chat(target_chat)
+        try:
+            target_entity = await user_app_1.get_chat(target_chat)
+        except Exception:
+            # Refresh user session's dialog cache to fix "Peer id invalid" on private channels
+            await status_msg.edit_text(f"🔄 <b>Refreshing session peer cache for:</b> <code>{target_raw}</code>...")
+            async for dialog in user_app_1.get_dialogs():
+                if dialog.chat and dialog.chat.id == target_chat:
+                    break
+            target_entity = await user_app_1.get_chat(target_chat)
+
         target_id = target_entity.id
         target_title = target_entity.title or str(target_id)
     except (ChannelInvalid, ChannelPrivate):
