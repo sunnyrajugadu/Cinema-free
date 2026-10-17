@@ -1,0 +1,2932 @@
+import asyncio
+import html
+import re
+import aiohttp
+from datetime import datetime
+
+from bson import ObjectId
+
+from pyrogram import filters, enums
+from pyrogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup
+)
+
+from config import (
+    STORAGE_CHANNEL_ID,
+    BOT_TOKEN
+)
+
+from bot import app
+
+from database import models as db_models
+
+from utils.logger import send_log
+
+from utils.caption import make_file_caption
+
+from utils.rename import clean_file_name
+
+from utils.detectors import detect_languages
+
+from filters.fsub import (
+    is_subscribed,
+    FSUB_ALERT
+)
+
+from keyboards.buttons import (
+    start_buttons,
+    about_buttons
+)
+
+
+print(
+    "✅ callbacks.py imported",
+    flush=True
+)
+
+
+def convert_markup_to_dict(markup) -> dict | None:
+    """Converts Pyrogram InlineKeyboardMarkup to Bot API JSON dict so native HTML blockquote always renders."""
+    if not markup or not getattr(markup, "inline_keyboard", None):
+        return None
+    keyboard = []
+    for row in markup.inline_keyboard:
+        btn_row = []
+        for btn in row:
+            b = {"text": btn.text}
+            if getattr(btn, "url", None):
+                b["url"] = btn.url
+            elif getattr(btn, "callback_data", None):
+                b["callback_data"] = (
+                    btn.callback_data.decode()
+                    if isinstance(btn.callback_data, bytes)
+                    else str(btn.callback_data)
+                )
+            elif getattr(btn, "switch_inline_query_current_chat", None) is not None:
+                b["switch_inline_query_current_chat"] = btn.switch_inline_query_current_chat
+            elif getattr(btn, "switch_inline_query", None) is not None:
+                b["switch_inline_query"] = btn.switch_inline_query
+            elif getattr(btn, "web_app", None):
+                b["web_app"] = {"url": btn.web_app.url}
+            elif getattr(btn, "user_id", None):
+                b["url"] = f"tg://user?id={btn.user_id}"
+            btn_row.append(b)
+        if btn_row:
+            keyboard.append(btn_row)
+    return {"inline_keyboard": keyboard}
+
+
+async def edit_caption_with_quote(query: CallbackQuery, caption_html: str, markup: InlineKeyboardMarkup):
+    """Edits message caption/text via Telegram Bot API so <blockquote> renders on any Pyrogram version."""
+    markup_dict = convert_markup_to_dict(markup)
+    is_media = bool(query.message and (query.message.photo or query.message.video or query.message.document or query.message.animation))
+
+    try:
+        method = "editMessageCaption" if is_media else "editMessageText"
+        api_url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+        payload = {
+            "chat_id": query.message.chat.id,
+            "message_id": query.message.id,
+            "parse_mode": "HTML"
+        }
+        if is_media:
+            payload["caption"] = caption_html
+        else:
+            payload["text"] = caption_html
+
+        if markup_dict:
+            payload["reply_markup"] = markup_dict
+
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=4.0)) as session:
+            async with session.post(api_url, json=payload) as resp:
+                res = await resp.json(content_type=None)
+                if resp.status == 200 and res.get("ok"):
+                    return
+    except Exception as api_err:
+        print(f"⚠️ Bot API edit fallback: {api_err}", flush=True)
+
+    if is_media:
+        await query.message.edit_caption(
+            caption=caption_html,
+            parse_mode=enums.ParseMode.HTML,
+            reply_markup=markup
+        )
+    else:
+        await query.message.edit_text(
+            text=caption_html,
+            parse_mode=enums.ParseMode.HTML,
+            reply_markup=markup
+        )
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+MENU_EXPIRE_SECONDS = 300
+
+FILES_PER_PAGE = 7
+
+FILE_DELETE_SECONDS = 300
+
+NOTICE_DELETE_SECONDS = 30
+
+
+# ============================================================
+# SIZE FORMAT
+# ============================================================
+
+def format_size(size):
+
+    try:
+
+        size = int(size or 0)
+
+    except Exception:
+
+        size = 0
+
+    if size >= 1024 ** 3:
+
+        return (
+            f"{size / (1024 ** 3):.2f} GB"
+        )
+
+    if size >= 1024 ** 2:
+
+        return (
+            f"{size / (1024 ** 2):.2f} MB"
+        )
+
+    if size >= 1024:
+
+        return (
+            f"{size / 1024:.2f} KB"
+        )
+
+    return f"{size:.0f} B"
+
+
+# ============================================================
+# AUDIO FORMAT
+# ============================================================
+
+def format_audio(audio):
+
+    if isinstance(audio, list):
+
+        values = []
+
+        for item in audio:
+
+            if item:
+
+                value = str(
+                    item
+                ).strip()
+
+                if value:
+
+                    values.append(
+                        value
+                    )
+
+        if values:
+
+            return ", ".join(
+                dict.fromkeys(values)
+            )
+
+        return ""
+
+    if audio is None:
+
+        return ""
+
+    audio = str(
+        audio
+    ).strip()
+
+    if not audio:
+
+        return ""
+
+    return audio
+
+
+# ============================================================
+# FILE NAME FALLBACK
+# ============================================================
+
+def get_actual_file_name(file):
+
+    """
+    Always return the real filename when available.
+
+    Priority:
+    1. file_name
+    2. original_file_name
+    3. movie_name
+
+    Never return literal 'Unknown'.
+    """
+
+    raw_name = (
+        file.get("file_name")
+        or file.get("original_file_name")
+        or file.get("movie_name")
+        or ""
+    )
+
+    cleaned = clean_file_name(
+        str(raw_name)
+    )
+
+    if (
+        cleaned
+        and cleaned.lower() != "unknown"
+    ):
+
+        return cleaned
+
+    original = str(
+        file.get("file_name")
+        or file.get("original_file_name")
+        or ""
+    ).strip()
+
+    if (
+        original
+        and original.lower() != "unknown"
+    ):
+
+        return original
+
+    movie_name = str(
+        file.get("movie_name")
+        or ""
+    ).strip()
+
+    if (
+        movie_name
+        and movie_name.lower() != "unknown"
+    ):
+
+        return movie_name
+
+    return "File"
+
+
+# ============================================================
+# FILE DISPLAY NAME
+# ============================================================
+
+def get_file_display_name(file):
+    """
+    Return the complete cleaned filename.
+
+    Used for inline file buttons.
+    """
+
+    return get_actual_file_name(
+        file
+    )
+
+
+# ============================================================
+# SEND ALL CAPTION
+# ============================================================
+
+def make_send_all_caption(file):
+    """
+    Caption used ONLY for Send All.
+
+    Send All intentionally does NOT use
+    make_file_caption().
+    """
+
+    file_name = get_actual_file_name(
+        file
+    )
+
+    size = format_size(
+        file.get(
+            "file_size_bytes",
+            0
+        )
+    )
+
+    safe_file_name = html.escape(
+        str(file_name)
+    )
+
+    safe_size = html.escape(
+        str(size)
+    )
+
+    return (
+        '<a href="https://t.me/CinemaVetaBot">'
+        '<b>@CinemaVetaBot -</b>'
+        '</a>\n'
+
+        '<a href="https://t.me/mrDuDeHoLic">'
+        '<b>@mrDuDeHoLic -</b>'
+        '</a> '
+
+        f'<b>{safe_file_name}\n'
+        f'Size :- {safe_size}</b>'
+    )
+
+
+# ============================================================
+# USER MENTION
+# ============================================================
+
+def make_user_mention(user):
+    """
+    Always display the user's REAL Telegram name.
+
+    Clicking the name opens the user's Telegram profile.
+    """
+
+    display_name = (
+        user.first_name
+        or "User"
+    )
+
+    if user.last_name:
+
+        display_name = (
+            f"{display_name} "
+            f"{user.last_name}"
+        )
+
+    return (
+        f'<a href="tg://user?id={user.id}">'
+        f'<b>{html.escape(display_name)}</b>'
+        f'</a>'
+    )
+
+
+# ============================================================
+# SINGLE FILE INSTRUCTION MESSAGE
+# ============================================================
+
+def make_single_instruction_message():
+
+    return (
+        "‼️ File Delete In 5 mins\n"
+        "(Due To Avoid Copyrights 😌)\n\n"
+
+        "👉 Forward to your "
+        "𝗦𝗮𝘃𝗲𝗱 𝗠𝗲𝘀𝘀𝗮𝗴𝗲𝘀 immediately 💌"
+    )
+
+
+# ============================================================
+# SEND ALL INSTRUCTION MESSAGE
+# ============================================================
+
+def make_send_all_instruction_message(
+    count
+):
+
+    return (
+        f"‼️ {count} Files Delete In 5 mins\n"
+        "(Due To Avoid Copyrights 😌)\n\n"
+
+        "👉 Forward to your "
+        "𝗦𝗮𝘃𝗲𝗱 𝗠𝗲𝘀𝘀𝗮𝗴𝗲𝘀 immediately 💌"
+    )
+
+
+# ============================================================
+# SINGLE FILE DELETE MESSAGE
+# ============================================================
+
+def make_single_delete_message(user):
+
+    mention = make_user_mention(
+        user
+    )
+
+    return (
+        f"𝗛𝗲𝘆 {mention},\n\n"
+
+        "⚠️ 𝗬𝗼𝘂𝗿 𝗥𝗲𝗾𝘂𝗲𝘀𝘁 "
+        "𝗛𝗮𝘀 𝗕𝗲𝗲𝗻 𝗗𝗲𝗹𝗲𝘁𝗲𝗱 👍🏻\n"
+
+        "(Due To Avoid Copyright Issues 😌)\n\n"
+
+        "𝗜𝗳 𝗬𝗼𝘂 𝗪𝗮𝗻𝘁 𝗧𝗵𝗮𝘁 𝗙𝗶𝗹𝗲, "
+        "𝗥𝗲𝗾𝘂𝗲𝘀𝘁 𝗔𝗴𝗮𝗶𝗻 ❤️"
+    )
+
+
+# ============================================================
+# SEND ALL DELETE MESSAGE
+# ============================================================
+
+def make_send_all_delete_message(
+    user,
+    count
+):
+
+    mention = make_user_mention(
+        user
+    )
+
+    return (
+        f"𝗛𝗲𝘆 {mention},\n\n"
+
+        f"⚠️ 𝗬𝗼𝘂𝗿 𝗥𝗲𝗾𝘂𝗲𝘀𝘁𝗲𝗱 "
+        f"{count} 𝗙𝗶𝗹𝗲𝘀 "
+        "𝗛𝗮𝘃𝗲 𝗕𝗲𝗲𝗻 𝗗𝗲𝗹𝗲𝘁𝗲𝗱 👍🏻\n"
+
+        "(Due To Avoid Copyright Issues 😌)\n\n"
+
+        f"𝗜𝗳 𝗬𝗼𝘂 𝗪𝗮𝗻𝘁 "
+        f"{'𝗧𝗵𝗼𝘀𝗲 𝗙𝗶𝗹𝗲𝘀' if count != 1 else '𝗧𝗵𝗮𝘁 𝗙𝗶𝗹𝗲'}, "
+        "𝗥𝗲𝗾𝘂𝗲𝘀𝘁 𝗔𝗴𝗮𝗶𝗻 ❤️"
+    )
+
+
+# ============================================================
+# AUTO DELETE INSTRUCTION MESSAGE (30 SECONDS)
+# ============================================================
+
+async def delete_instruction_later(
+    client,
+    chat_id,
+    message_id
+):
+
+    try:
+
+        await asyncio.sleep(
+            NOTICE_DELETE_SECONDS
+        )
+
+        await client.delete_messages(
+            chat_id=chat_id,
+            message_ids=message_id
+        )
+
+    except Exception:
+
+        pass
+
+
+# ============================================================
+# DELETE SINGLE SENT FILE AFTER 5 MINUTES
+# ============================================================
+
+async def delete_single_file_later(
+    client,
+    chat_id,
+    message_id,
+    user
+):
+
+    try:
+
+        await asyncio.sleep(
+            FILE_DELETE_SECONDS
+        )
+
+        deleted = False
+
+        try:
+
+            await client.delete_messages(
+                chat_id=chat_id,
+                message_ids=message_id
+            )
+
+            deleted = True
+
+            print(
+                f"🗑️ Single file deleted: "
+                f"{chat_id}:{message_id}",
+                flush=True
+            )
+
+        except Exception as delete_error:
+
+            print(
+                f"⚠️ Single file delete error: "
+                f"{delete_error}",
+                flush=True
+            )
+
+        # ====================================================
+        # SEND DELETE NOTIFICATION (DELETES IN 30 SECONDS)
+        # ====================================================
+
+        if deleted:
+
+            try:
+
+                notice_msg = await client.send_message(
+                    chat_id=chat_id,
+                    text=make_single_delete_message(
+                        user
+                    )
+                )
+
+                if notice_msg:
+
+                    asyncio.create_task(
+                        delete_instruction_later(
+                            client=client,
+                            chat_id=chat_id,
+                            message_id=notice_msg.id
+                        )
+                    )
+
+            except Exception as notify_error:
+
+                print(
+                    f"⚠️ Single delete notification error: "
+                    f"{notify_error}",
+                    flush=True
+                )
+
+    except asyncio.CancelledError:
+
+        print(
+            "⚠️ Single delete task cancelled",
+            flush=True
+        )
+
+        raise
+
+    except Exception as e:
+
+        print(
+            f"❌ Single delete task error: {e}",
+            flush=True
+        )
+
+
+# ============================================================
+# DELETE SEND ALL FILES + MESSAGES AFTER 5 MINUTES
+# ============================================================
+
+async def delete_send_all_later(
+    client,
+    chat_id,
+    message_ids,
+    success_message_id,
+    user,
+    count
+):
+
+    try:
+
+        await asyncio.sleep(
+            FILE_DELETE_SECONDS
+        )
+
+        deleted_count = 0
+
+        # ====================================================
+        # DELETE ALL SENT FILES
+        # ====================================================
+
+        for message_id in message_ids:
+
+            try:
+
+                await client.delete_messages(
+                    chat_id=chat_id,
+                    message_ids=message_id
+                )
+
+                deleted_count += 1
+
+                print(
+                    f"🗑️ Send All file deleted: "
+                    f"{chat_id}:{message_id}",
+                    flush=True
+                )
+
+            except Exception as delete_error:
+
+                print(
+                    f"⚠️ Send All file delete error "
+                    f"for {message_id}: "
+                    f"{delete_error}",
+                    flush=True
+                )
+
+        # ====================================================
+        # DELETE SUCCESS MESSAGE
+        # ====================================================
+
+        if success_message_id:
+
+            try:
+
+                await client.delete_messages(
+                    chat_id=chat_id,
+                    message_ids=success_message_id
+                )
+
+                print(
+                    f"🗑️ Send All success message deleted: "
+                    f"{chat_id}:{success_message_id}",
+                    flush=True
+                )
+
+            except Exception as success_delete_error:
+
+                print(
+                    f"⚠️ Success message delete error: "
+                    f"{success_delete_error}",
+                    flush=True
+                )
+
+        # ====================================================
+        # SEND FINAL DELETE NOTIFICATION (DELETES IN 30 SECONDS)
+        # ====================================================
+
+        if deleted_count > 0:
+
+            try:
+
+                notice_msg = await client.send_message(
+                    chat_id=chat_id,
+                    text=make_send_all_delete_message(
+                        user,
+                        count
+                    )
+                )
+
+                if notice_msg:
+
+                    asyncio.create_task(
+                        delete_instruction_later(
+                            client=client,
+                            chat_id=chat_id,
+                            message_id=notice_msg.id
+                        )
+                    )
+
+                print(
+                    f"✅ Final Send All delete notification sent "
+                    f"for {count} files",
+                    flush=True
+                )
+
+            except Exception as notify_error:
+
+                print(
+                    f"⚠️ Send All notification error: "
+                    f"{notify_error}",
+                    flush=True
+                )
+
+    except asyncio.CancelledError:
+
+        print(
+            "⚠️ Send All delete task cancelled",
+            flush=True
+        )
+
+        raise
+
+    except Exception as e:
+
+        print(
+            f"❌ Send All delete task error: {e}",
+            flush=True
+        )
+
+
+# ============================================================
+# EXPIRY CHECK (DELETES MENU ON EXPIRY SILENTLY)
+# ============================================================
+
+async def check_expiry(query):
+
+    try:
+
+        data = query.data.split(
+            ":"
+        )
+
+        if data[0] in (
+            "file",
+            "lang",
+            "page",
+            "all",
+            "open_lang",
+            "back_files"
+        ):
+
+            timestamp = int(
+                data[-1]
+            )
+
+            now = int(
+                datetime.now().timestamp()
+            )
+
+            if (
+                now - timestamp
+                > MENU_EXPIRE_SECONDS
+            ):
+
+                try:
+
+                    await query.message.delete()
+
+                except Exception:
+
+                    pass
+
+                return True
+
+    except Exception as e:
+
+        print(
+            f"⚠️ Expiry check error: {e}",
+            flush=True
+        )
+
+    return False
+
+
+# ============================================================
+# AUTO DELETE MENU AFTER 5 MINUTES
+# ============================================================
+
+async def auto_delete_menu(client, chat_id, message_id):
+    try:
+        await asyncio.sleep(MENU_EXPIRE_SECONDS)
+        await client.delete_messages(
+            chat_id=chat_id,
+            message_ids=message_id
+        )
+    except Exception:
+        pass
+
+
+
+# ============================================================
+# FILE BUTTON
+# ============================================================
+
+def file_button(
+    file,
+    user_id,
+    timestamp
+):
+
+    size = format_size(
+        file.get(
+            "file_size_bytes",
+            0
+        )
+    )
+
+    display_name = get_file_display_name(
+        file
+    )
+
+    file_id = file.get(
+        "_id"
+    )
+
+    return InlineKeyboardButton(
+        text=(
+            f"{size} | "
+            f"{display_name}"
+        ),
+        callback_data=(
+            f"file:"
+            f"{user_id}:"
+            f"{file_id}:"
+            f"{timestamp}"
+        )
+    )
+
+
+# ============================================================
+# LANGUAGE BUTTON (MAIN VIEW)
+# ============================================================
+
+def language_buttons(
+    search_id,
+    timestamp,
+    selected=None
+):
+    """
+    Returns a single button for the main view.
+    When clicked, it opens the expanded language menu.
+    """
+    return [
+        [
+            InlineKeyboardButton(
+                text=f"Language",
+                callback_data=f"open_lang:{search_id}:{timestamp}"
+            )
+        ]
+    ]
+
+
+# ============================================================
+# EXPANDED LANGUAGE MENU
+# ============================================================
+
+def expanded_language_menu(search_id, timestamp):
+    """
+    Generates the vertically stacked language selection menu.
+    """
+    buttons = []
+
+    # Header
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                "⇊ SELECT LANGUAGE ⇊",
+                callback_data="none"
+            )
+        ]
+    )
+
+    langs = [
+        "All",
+        "English",
+        "Hindi",
+        "Telugu",
+        "Tamil",
+        "Malayalam",
+        "Kannada"
+    ]
+
+    # Vertical List
+    for lang in langs:
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    lang,
+                    callback_data=f"lang:{lang}:{search_id}:{timestamp}"
+                )
+            ]
+        )
+
+    # Footer
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                "↭ BACK TO FILES ↭",
+                callback_data=f"back_files:{search_id}:{timestamp}"
+            )
+        ]
+    )
+
+    return buttons
+
+
+# ============================================================
+# PAGINATION
+# ============================================================
+
+def pagination_buttons(
+    search_id,
+    page,
+    total,
+    timestamp
+):
+
+    row = []
+
+    total_pages = (
+        total + FILES_PER_PAGE - 1
+    ) // FILES_PER_PAGE
+
+    if total_pages < 1:
+
+        total_pages = 1
+
+    if page > 1:
+
+        row.append(
+            InlineKeyboardButton(
+                "⪻ Previous",
+                callback_data=(
+                    f"page:"
+                    f"{search_id}:"
+                    f"{page - 1}:"
+                    f"{timestamp}"
+                )
+            )
+        )
+
+    row.append(
+        InlineKeyboardButton(
+            f"📄 {page}/{total_pages}",
+            callback_data="none"
+        )
+    )
+
+    if page < total_pages:
+
+        row.append(
+            InlineKeyboardButton(
+                "Next ⪼",
+                callback_data=(
+                    f"page:"
+                    f"{search_id}:"
+                    f"{page + 1}:"
+                    f"{timestamp}"
+                )
+            )
+        )
+
+    return [row]
+
+
+# ============================================================
+# FILE ID CONVERSION
+# ============================================================
+
+def make_object_id(file_id):
+
+    try:
+
+        if isinstance(
+            file_id,
+            ObjectId
+        ):
+
+            return file_id
+
+        if ObjectId.is_valid(
+            str(file_id)
+        ):
+
+            return ObjectId(
+                str(file_id)
+            )
+
+    except Exception as e:
+
+        print(
+            f"⚠️ ObjectId error: {e}",
+            flush=True
+        )
+
+    return None
+
+
+# ============================================================
+# FIND FILE
+# ============================================================
+
+async def find_file(file_id):
+
+    object_id = make_object_id(
+        file_id
+    )
+
+    if object_id is None:
+
+        return None
+
+    try:
+
+        collection = db_models.files()
+
+        file = await collection.find_one(
+            {
+                "_id": object_id
+            }
+        )
+
+        return file
+
+    except Exception as e:
+
+        print(
+            f"❌ DB file lookup error: {e}",
+            flush=True
+        )
+
+        return None
+
+
+# ============================================================
+# LANGUAGE MATCH (ENHANCED FOR MULTI-AUDIO)
+# ============================================================
+
+def file_has_language(
+    file,
+    language
+):
+
+    if not language:
+
+        return False
+
+    target_lang = str(
+        language
+    ).strip().lower()
+
+    if target_lang == "all":
+
+        return True
+
+    languages = file.get(
+        "languages",
+        []
+    )
+
+    if isinstance(languages, list):
+
+        for item in languages:
+
+            if str(item).strip().lower() == target_lang:
+
+                return True
+
+    old_language = file.get(
+        "language"
+    )
+
+    if old_language:
+
+        if isinstance(old_language, list):
+
+            for item in old_language:
+
+                if str(item).strip().lower() == target_lang:
+
+                    return True
+
+        else:
+
+            values = re.split(
+                r"[+/,|]+",
+                str(old_language)
+            )
+
+            for item in values:
+
+                if item.strip().lower() == target_lang:
+
+                    return True
+
+    raw_name = (
+        file.get("file_name")
+        or file.get("original_file_name")
+        or file.get("movie_name")
+        or ""
+    )
+
+    if raw_name:
+
+        detected = detect_languages(str(raw_name))
+
+        for lang_name in detected:
+
+            if lang_name.lower() == target_lang:
+
+                return True
+
+    return False
+
+
+# ============================================================
+# FILTER CACHE FILES
+# ============================================================
+
+def filter_language_files(
+    files,
+    language
+):
+
+    if not files:
+
+        return []
+
+    if (
+        not language
+        or language.lower() == "all"
+    ):
+
+        return list(
+            files
+        )
+
+    filtered = []
+
+    for file in files:
+
+        if file_has_language(
+            file,
+            language
+        ):
+
+            filtered.append(
+                file
+            )
+
+    return filtered
+
+
+# ============================================================
+# FORCE SUB RETRY CALLBACK
+# ============================================================
+
+@app.on_callback_query(
+    filters.regex(r"^fsub_retry:(.*)")
+)
+async def fsub_retry_callback(
+    client,
+    query: CallbackQuery
+):
+    try:
+        user_id = query.from_user.id
+        raw_data = query.data.split(":", 1)[1].strip()
+
+        # Re-check channel membership
+        if not await is_subscribed(client, user_id):
+            return await query.answer(
+                FSUB_ALERT,
+                show_alert=True
+            )
+
+        # Parse message_id and payload if packed together
+        reply_to_id = None
+        payload = raw_data
+        if ":" in raw_data:
+            parts = raw_data.split(":", 1)
+            if parts[0].isdigit():
+                reply_to_id = int(parts[0])
+                payload = parts[1].strip()
+
+        # Fallback to direct reply_to_message if present
+        if not reply_to_id and query.message and query.message.reply_to_message:
+            reply_to_id = query.message.reply_to_message.id
+
+        await query.answer("✅ Verified! Processing request...")
+
+        # Delete the FSub warning prompt
+        try:
+            await query.message.delete()
+        except Exception:
+            pass
+
+        # 1. TRIGGERED FROM INLINE SEARCH FSUB
+        if payload in ["inline_fsub", "fsub", "/start inline_fsub", "/start fsub"]:
+            inline_launch_markup = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "🔍 Search Files Now",
+                        switch_inline_query_current_chat=""
+                    )
+                ]
+            ])
+            await client.send_message(
+                chat_id=user_id,
+                text=(
+                    "✅ <b>Joined Successful!</b>\n\n"
+                    "**Click the button below to search and download files directly** 🥀"
+                ),
+                reply_markup=inline_launch_markup
+            )
+            return
+
+        if not payload:
+            await client.send_message(
+                chat_id=user_id,
+                text="🎉 You are now verified! Send any movie name to search."
+            )
+            return
+
+        # ================= ROUTE COMMANDS ================= #
+        if payload.startswith("/"):
+            cmd = payload.split()[0].lower()
+
+            dummy_msg = query.message.reply_to_message if (query.message and query.message.reply_to_message) else query.message
+
+            if cmd == "/ping":
+                from handlers.ping import ping_command
+                await ping_command(client, dummy_msg)
+
+            elif cmd == "/usage":
+                from handlers.usage import usage_command
+                await usage_command(client, dummy_msg)
+
+            elif cmd == "/stats":
+                from handlers.stats import stats_command
+                await stats_command(client, dummy_msg)
+
+            elif cmd == "/start":
+                from handlers.start import start_command
+                parts = payload.split()
+                if len(parts) > 1:
+                    dummy_msg.command = ["start", parts[1]]
+                else:
+                    dummy_msg.command = ["start"]
+                await start_command(client, dummy_msg)
+
+            else:
+                await client.send_message(
+                    chat_id=user_id,
+                    text=f"✅ Verified! Send `{payload}` again."
+                )
+
+        else:
+            # ================= EXECUTE SEARCH WITH DIRECT QUOTE REPLY ================= #
+            from handlers.search import execute_search
+            await execute_search(
+                client=client,
+                user=query.from_user,
+                chat_id=user_id,
+                movie_name=payload,
+                reply_to_message_id=reply_to_id,
+                allow_spelling_suggestions=True
+            )
+
+    except Exception as e:
+        print(f"❌ FSUB RETRY CALLBACK ERROR: {e}", flush=True)
+        try:
+            await query.answer("❌ Verification check failed.", show_alert=True)
+        except Exception:
+            pass
+
+
+# ============================================================
+# HOME / ABOUT (WITH QUOTE BOX)
+# ============================================================
+
+@app.on_callback_query(
+    filters.regex(r"^home_(?:main|about)$")
+)
+async def home_about_callback(
+    client,
+    query: CallbackQuery
+):
+    """Handle About and Home navigation."""
+
+    try:
+
+        me = await client.get_me()
+
+        bot_name = (
+            me.first_name
+            or me.username
+            or "Bot"
+        )
+
+        bot_name = html.escape(
+            bot_name
+        )
+
+        # ====================================================
+        # ABOUT
+        # ====================================================
+
+        if query.data == "home_about":
+
+            about_text = (
+                f"<blockquote>✯ <b>𝐁𝐨𝐭 𝐍𝐚𝐦𝐞:</b> {bot_name}\n"
+                '✯ <b>𝐂𝐫𝐞𝐚𝐭𝐨𝐫 :</b> '
+                '<a href="https://t.me/mrDuDeHoLic">'
+                '<b>mrDuDeHoLic</b>'
+                '</a>\n\n'
+                "📝 ʟᴀɴɢᴜᴀɢᴇ : Python\n\n"
+                "📡 ʜᴏsᴛᴇᴅ ᴏɴ : VPS\n\n"
+                "🌟 ᴠᴇʀsɪᴏɴ : 2.0</blockquote>"
+            )
+
+            await edit_caption_with_quote(
+                query=query,
+                caption_html=about_text,
+                markup=about_buttons()
+            )
+
+            await query.answer()
+            return
+
+        # ====================================================
+        # HOME
+        # ====================================================
+
+        user = query.from_user
+        safe_name = html.escape(user.first_name or "User")
+        user_link = f'<a href="tg://user?id={user.id}">{safe_name}</a>'
+
+        home_caption = (
+            f"<blockquote><b>🎬✨ Hey {user_link}! 👋\n\n"
+            "✨ Welcome to CinemaVeta 🍿🔥\n\n"
+            "🔍 Search your favorite Movies & Series\n\n"
+            "💭 Just type the movie name and get files instantly 🚀</b></blockquote>"
+        )
+
+        await edit_caption_with_quote(
+            query=query,
+            caption_html=home_caption,
+            markup=start_buttons()
+        )
+
+        await query.answer()
+
+    except Exception as e:
+
+        print(
+            f"❌ HOME/ABOUT ERROR: {e}",
+            flush=True
+        )
+
+        try:
+            await query.answer(
+                "❌ Unable to open this menu",
+                show_alert=True
+            )
+        except Exception:
+            pass
+
+
+# ============================================================
+# SEND SINGLE FILE
+# ============================================================
+
+@app.on_callback_query(
+    filters.regex(
+        r"^file:"
+    )
+)
+async def send_file(
+    client,
+    query: CallbackQuery
+):
+
+    try:
+
+        if await check_expiry(
+            query
+        ):
+
+            return
+
+        parts = query.data.split(
+            ":"
+        )
+
+        if len(parts) != 4:
+
+            return await query.answer(
+                "❌ Invalid file button",
+                show_alert=True
+            )
+
+        _, user_id, file_id, timestamp = (
+            parts
+        )
+
+        user_id = int(
+            user_id
+        )
+
+        # ====================================================
+        # USER CHECK
+        # ====================================================
+
+        if query.from_user.id != user_id:
+
+            return await query.answer(
+                "⚠️ This button is not for you",
+                show_alert=True
+            )
+
+        # ====================================================
+        # FIND FILE
+        # ====================================================
+
+        file = await find_file(
+            file_id
+        )
+
+        if not file:
+
+            return await query.answer(
+                "❌ File not found in database",
+                show_alert=True
+            )
+
+        # ====================================================
+        # SINGLE FILE CAPTION
+        # ====================================================
+
+        caption = make_file_caption(
+            file
+        )
+
+        channel_id = file.get(
+            "channel_id"
+        )
+
+        message_id = file.get(
+            "message_id"
+        )
+
+        if not channel_id:
+
+            return await query.answer(
+                "❌ Storage channel missing",
+                show_alert=True
+            )
+
+        if not message_id:
+
+            return await query.answer(
+                "❌ Message ID missing",
+                show_alert=True
+            )
+
+        # ====================================================
+        # COPY FILE (DIRECT TO USER PRIVATE CHAT)
+        # ====================================================
+
+        sent_message = await client.copy_message(
+            chat_id=user_id,
+            from_chat_id=channel_id,
+            message_id=int(
+                message_id
+            ),
+            caption=caption
+        )
+
+        # ====================================================
+        # SEPARATE INSTRUCTION MESSAGE (DELETES IN 30s)
+        # ====================================================
+
+        if sent_message:
+
+            instruction_msg = await client.send_message(
+                chat_id=user_id,
+                text=make_single_instruction_message()
+            )
+
+            if instruction_msg:
+
+                asyncio.create_task(
+                    delete_instruction_later(
+                        client=client,
+                        chat_id=user_id,
+                        message_id=instruction_msg.id
+                    )
+                )
+
+        # ====================================================
+        # ANSWER CALLBACK
+        # ====================================================
+
+        await query.answer(
+            "File Sent ✅"
+        )
+
+        # ====================================================
+        # AUTO DELETE FILE TASK (DELETES IN 5 MINS)
+        # ====================================================
+
+        if sent_message:
+
+            asyncio.create_task(
+                delete_single_file_later(
+                    client=client,
+                    chat_id=user_id,
+                    message_id=sent_message.id,
+                    user=query.from_user
+                )
+            )
+
+        # ====================================================
+        # LOG
+        # ====================================================
+
+        try:
+
+            await send_log(
+                f"""
+⬇️ <b>File Downloaded</b>
+
+👤 User:
+<code>{user_id}</code>
+
+📒 File:
+<code>{html.escape(get_actual_file_name(file))}</code>
+
+📍 Chat:
+<code>{user_id}</code>
+
+⏱ Auto Delete:
+<code>5 Minutes</code>
+"""
+            )
+
+        except Exception as log_error:
+
+            print(
+                f"⚠️ Single file log error: "
+                f"{log_error}",
+                flush=True
+            )
+
+    except Exception as e:
+
+        import traceback
+
+        print(
+            "❌ FILE ERROR:",
+            repr(e),
+            flush=True
+        )
+
+        traceback.print_exc()
+
+        try:
+
+            await query.answer(
+                "❌ Something went wrong",
+                show_alert=True
+            )
+
+        except Exception:
+
+            pass
+
+
+# ============================================================
+# OPEN EXPANDED LANGUAGE MENU
+# ============================================================
+
+@app.on_callback_query(
+    filters.regex(r"^open_lang:")
+)
+async def open_language_menu_callback(
+    client,
+    query: CallbackQuery
+):
+    try:
+        if await check_expiry(query):
+            return
+
+        parts = query.data.split(":")
+        
+        if len(parts) != 3:
+            return await query.answer("❌ Invalid language request", show_alert=True)
+            
+        _, search_id, timestamp = parts
+
+        buttons = expanded_language_menu(search_id, timestamp)
+
+        await query.message.edit_reply_markup(
+            InlineKeyboardMarkup(buttons)
+        )
+
+        await query.answer()
+
+    except Exception as e:
+        print(f"❌ OPEN LANG ERROR: {e}", flush=True)
+        try:
+            await query.answer("❌ Error opening language menu", show_alert=True)
+        except Exception:
+            pass
+
+
+# ============================================================
+# BACK TO FILES FROM LANGUAGE MENU
+# ============================================================
+
+@app.on_callback_query(
+    filters.regex(r"^back_files:")
+)
+async def back_to_files_callback(
+    client,
+    query: CallbackQuery
+):
+    try:
+        if await check_expiry(query):
+            return
+
+        parts = query.data.split(":")
+        
+        if len(parts) != 3:
+            return await query.answer("❌ Invalid request", show_alert=True)
+            
+        _, search_id, timestamp = parts
+
+        cache = await db_models.get_search_cache(search_id)
+
+        if not cache:
+            return await query.answer("❌ Search expired", show_alert=True)
+
+        page = cache.get("current_page") or cache.get("page") or 1
+        language = cache.get("selected_language", "All")
+        original_files = cache.get("files", [])
+
+        files = filter_language_files(original_files, language)
+
+        start = (page - 1) * FILES_PER_PAGE
+        end = start + FILES_PER_PAGE
+        results = files[start:end]
+
+        if not results and files:
+            results = files[:FILES_PER_PAGE]
+            page = 1
+
+        buttons = []
+
+        for file in results:
+            buttons.append(
+                [
+                    file_button(
+                        file,
+                        query.from_user.id,
+                        timestamp
+                    )
+                ]
+            )
+
+        buttons.extend(
+            language_buttons(
+                search_id,
+                timestamp,
+                language
+            )
+        )
+
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    "📤 Send All",
+                    callback_data=(
+                        f"all:"
+                        f"{query.from_user.id}:"
+                        f"{search_id}:"
+                        f"{timestamp}"
+                    )
+                )
+            ]
+        )
+
+        buttons.extend(
+            pagination_buttons(
+                search_id,
+                page,
+                len(files),
+                timestamp
+            )
+        )
+
+        await query.message.edit_reply_markup(
+            InlineKeyboardMarkup(buttons)
+        )
+
+        await query.answer("🔙 Back to files")
+
+    except Exception as e:
+        print(f"❌ BACK TO FILES ERROR: {e}", flush=True)
+        try:
+            await query.answer("❌ Error returning to files", show_alert=True)
+        except Exception:
+            pass
+
+
+# ============================================================
+# LANGUAGE FILTER (PROCESS SELECTION)
+# ============================================================
+
+@app.on_callback_query(
+    filters.regex(
+        r"^lang:"
+    )
+)
+async def language_filter(
+    client,
+    query: CallbackQuery
+):
+
+    try:
+
+        if await check_expiry(
+            query
+        ):
+
+            return
+
+        parts = query.data.split(
+            ":"
+        )
+
+        if len(parts) != 4:
+
+            return await query.answer(
+                "❌ Invalid language button",
+                show_alert=True
+            )
+
+        _, language, search_id, timestamp = (
+            parts
+        )
+
+        # ====================================================
+        # GET CACHE
+        # ====================================================
+
+        cache = await db_models.get_search_cache(
+            search_id
+        )
+
+        if not cache:
+
+            return await query.answer(
+                "❌ Search expired",
+                show_alert=True
+            )
+
+        # ====================================================
+        # ORIGINAL FILES
+        # ====================================================
+
+        original_files = cache.get(
+            "files",
+            []
+        )
+
+        # ====================================================
+        # FILTER
+        # ====================================================
+
+        results = filter_language_files(
+            original_files,
+            language
+        )
+
+        if not results:
+
+            return await query.answer(
+                f"😿 No {language} files found",
+                show_alert=True
+            )
+
+        # ====================================================
+        # FIRST PAGE
+        # ====================================================
+
+        current_files = results[
+            :FILES_PER_PAGE
+        ]
+
+        # ====================================================
+        # SAVE STATE
+        # ====================================================
+
+        await db_models.update_search_state(
+            search_id,
+            current_files,
+            language,
+            1
+        )
+
+        # ====================================================
+        # BUILD MENU
+        # ====================================================
+
+        buttons = []
+
+        for file in current_files:
+
+            buttons.append(
+                [
+                    file_button(
+                        file,
+                        query.from_user.id,
+                        timestamp
+                    )
+                ]
+            )
+
+        # ====================================================
+        # LANGUAGE BUTTONS (SINGLE BUTTON FOR MAIN MENU)
+        # ====================================================
+
+        buttons.extend(
+            language_buttons(
+                search_id,
+                timestamp,
+                language
+            )
+        )
+
+        # ====================================================
+        # SEND ALL
+        # ====================================================
+
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    "📤 Send All",
+                    callback_data=(
+                        f"all:"
+                        f"{query.from_user.id}:"
+                        f"{search_id}:"
+                        f"{timestamp}"
+                    )
+                )
+            ]
+        )
+
+        # ====================================================
+        # PAGINATION
+        # ====================================================
+
+        buttons.extend(
+            pagination_buttons(
+                search_id,
+                1,
+                len(results),
+                timestamp
+            )
+        )
+
+        # ====================================================
+        # UPDATE MESSAGE
+        # ====================================================
+
+        await query.message.edit_reply_markup(
+            InlineKeyboardMarkup(
+                buttons
+            )
+        )
+
+        await query.answer(
+            f"✅ {language} selected"
+        )
+
+    except Exception as e:
+
+        print(
+            f"❌ LANGUAGE ERROR: {e}",
+            flush=True
+        )
+
+        try:
+
+            await query.answer(
+                "❌ Language filter error",
+                show_alert=True
+            )
+
+        except Exception:
+
+            pass
+
+
+# ============================================================
+# PAGINATION
+# ============================================================
+
+@app.on_callback_query(
+    filters.regex(
+        r"^page:"
+    )
+)
+async def pagination(
+    client,
+    query: CallbackQuery
+):
+
+    try:
+
+        if await check_expiry(
+            query
+        ):
+
+            return
+
+        parts = query.data.split(
+            ":"
+        )
+
+        if len(parts) != 4:
+
+            return await query.answer(
+                "❌ Invalid page button",
+                show_alert=True
+            )
+
+        _, search_id, page, timestamp = parts
+
+        page = int(
+            page
+        )
+
+        # ====================================================
+        # GET CACHE
+        # ====================================================
+
+        cache = await db_models.get_search_cache(
+            search_id
+        )
+
+        if not cache:
+
+            return await query.answer(
+                "❌ Search expired",
+                show_alert=True
+            )
+
+        # ====================================================
+        # SELECTED LANGUAGE
+        # ====================================================
+
+        language = cache.get(
+            "selected_language",
+            "All"
+        )
+
+        # ====================================================
+        # ORIGINAL FILES
+        # ====================================================
+
+        original_files = cache.get(
+            "files",
+            []
+        )
+
+        # ====================================================
+        # FILTER
+        # ====================================================
+
+        files = filter_language_files(
+            original_files,
+            language
+        )
+
+        if not files:
+
+            return await query.answer(
+                "❌ No files found",
+                show_alert=True
+            )
+
+        # ====================================================
+        # PAGE RANGE
+        # ====================================================
+
+        start = (
+            page - 1
+        ) * FILES_PER_PAGE
+
+        end = (
+            start
+            + FILES_PER_PAGE
+        )
+
+        results = files[
+            start:end
+        ]
+
+        if not results:
+
+            return await query.answer(
+                "❌ No files on this page",
+                show_alert=True
+            )
+
+        # ====================================================
+        # SAVE STATE
+        # ====================================================
+
+        await db_models.update_search_state(
+            search_id,
+            results,
+            language,
+            page
+        )
+
+        # ====================================================
+        # BUILD FILE BUTTONS
+        # ====================================================
+
+        buttons = []
+
+        for file in results:
+
+            buttons.append(
+                [
+                    file_button(
+                        file,
+                        query.from_user.id,
+                        timestamp
+                    )
+                ]
+            )
+
+        # ====================================================
+        # LANGUAGE BUTTONS
+        # ====================================================
+
+        buttons.extend(
+            language_buttons(
+                search_id,
+                timestamp,
+                language
+            )
+        )
+
+        # ====================================================
+        # SEND ALL
+        # ====================================================
+
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    "📤 Send All",
+                    callback_data=(
+                        f"all:"
+                        f"{query.from_user.id}:"
+                        f"{search_id}:"
+                        f"{timestamp}"
+                    )
+                )
+            ]
+        )
+
+        # ====================================================
+        # PAGINATION
+        # ====================================================
+
+        buttons.extend(
+            pagination_buttons(
+                search_id,
+                page,
+                len(files),
+                timestamp
+            )
+        )
+
+        # ====================================================
+        # UPDATE MENU
+        # ====================================================
+
+        await query.message.edit_reply_markup(
+            InlineKeyboardMarkup(
+                buttons
+            )
+        )
+
+        await query.answer()
+
+    except Exception as e:
+
+        print(
+            f"❌ PAGINATION ERROR: {e}",
+            flush=True
+        )
+
+        try:
+
+            await query.answer(
+                "❌ Pagination error",
+                show_alert=True
+            )
+
+        except Exception:
+
+            pass
+
+
+# ============================================================
+# SEND ALL FILES (EXACT CURRENT PAGE ONLY)
+# ============================================================
+
+@app.on_callback_query(
+    filters.regex(
+        r"^all:"
+    )
+)
+async def send_all_files(
+    client,
+    query: CallbackQuery
+):
+
+    try:
+
+        if await check_expiry(
+            query
+        ):
+
+            return
+
+        parts = query.data.split(
+            ":"
+        )
+
+        if len(parts) != 4:
+
+            return await query.answer(
+                "❌ Invalid Send All button",
+                show_alert=True
+            )
+
+        _, user_id, search_id, timestamp = parts
+
+        user_id = int(
+            user_id
+        )
+
+        # ====================================================
+        # USER CHECK
+        # ====================================================
+
+        if query.from_user.id != user_id:
+
+            return await query.answer(
+                "⚠️ This button is not for you",
+                show_alert=True
+            )
+
+        # ====================================================
+        # GET CACHE
+        # ====================================================
+
+        cache = await db_models.get_search_cache(
+            search_id
+        )
+
+        if not cache:
+
+            return await query.answer(
+                "❌ Search expired",
+                show_alert=True
+            )
+
+        # ====================================================
+        # EXTRACT EXACT CURRENT PAGE FILES (MAX 7 PER PAGE)
+        # ====================================================
+
+        current_page = cache.get("current_page") or cache.get("page") or 1
+        selected_lang = cache.get("selected_language") or "All"
+        original_files = cache.get("files", [])
+
+        # Filter by selected language
+        filtered_files = filter_language_files(original_files, selected_lang)
+
+        # Calculate exact slice for current page
+        start = (int(current_page) - 1) * FILES_PER_PAGE
+        end = start + FILES_PER_PAGE
+        files = filtered_files[start:end]
+
+        # Fallback to current_files if slice resulted empty
+        if not files:
+            files = cache.get("current_files", [])[:FILES_PER_PAGE]
+
+        if not files:
+
+            return await query.answer(
+                "❌ No files on this page",
+                show_alert=True
+            )
+
+        await query.answer(
+            "📨 Sending files..."
+        )
+
+        # ====================================================
+        # SENT MESSAGE IDS
+        # ====================================================
+
+        sent_message_ids = []
+
+        count = 0
+
+        # ====================================================
+        # SEND FILES FIRST (TO USER PM)
+        # ====================================================
+
+        for file in files:
+
+            try:
+
+                channel_id = file.get(
+                    "channel_id"
+                )
+
+                message_id = file.get(
+                    "message_id"
+                )
+
+                if not channel_id:
+
+                    print(
+                        "⚠️ Send All: "
+                        "channel_id missing",
+                        flush=True
+                    )
+
+                    continue
+
+                if not message_id:
+
+                    print(
+                        "⚠️ Send All: "
+                        "message_id missing",
+                        flush=True
+                    )
+
+                    continue
+
+                # ====================================================
+                # SEND ALL CAPTION
+                # ====================================================
+
+                caption = make_send_all_caption(
+                    file
+                )
+
+                # ====================================================
+                # COPY FILE
+                # ====================================================
+
+                sent_message = await client.copy_message(
+                    chat_id=user_id,
+                    from_chat_id=channel_id,
+                    message_id=int(
+                        message_id
+                    ),
+                    caption=caption
+                )
+
+                # ====================================================
+                # SAVE SENT MESSAGE ID
+                # ====================================================
+
+                if sent_message:
+
+                    sent_message_ids.append(
+                        sent_message.id
+                    )
+
+                    count += 1
+
+            except Exception as file_error:
+
+                print(
+                    f"⚠️ Send All File Error: "
+                    f"{file_error}",
+                    flush=True
+                )
+
+                continue
+
+        # ====================================================
+        # NO FILES SENT
+        # ====================================================
+
+        if count == 0:
+
+            return await query.message.reply_text(
+                "❌ No files could be sent."
+            )
+
+        # ====================================================
+        # SEARCH NAME
+        # ====================================================
+
+        search_text = (
+            cache.get("movie_name")
+            or cache.get("search_query")
+            or cache.get("query")
+            or cache.get("search")
+            or "Search"
+        )
+
+        # ====================================================
+        # SUCCESS MESSAGE
+        # ====================================================
+
+        success_message = await query.message.reply_text(
+            f"✅ Sent {count} files for "
+            f"'<b><code>{html.escape(str(search_text))}"
+            f"</code></b>' "
+            f"from the current page."
+        )
+
+        # ====================================================
+        # COPYRIGHT INSTRUCTION MESSAGE (DELETES IN 30s)
+        # ====================================================
+
+        instruction_message = await client.send_message(
+            chat_id=user_id,
+            text=make_send_all_instruction_message(
+                count
+            )
+        )
+
+        if instruction_message:
+
+            asyncio.create_task(
+                delete_instruction_later(
+                    client=client,
+                    chat_id=user_id,
+                    message_id=instruction_message.id
+                )
+            )
+
+        # ====================================================
+        # AUTO DELETE TASK (5 MINUTES)
+        # ====================================================
+
+        if sent_message_ids:
+
+            asyncio.create_task(
+                delete_send_all_later(
+                    client=client,
+                    chat_id=user_id,
+                    message_ids=sent_message_ids,
+                    success_message_id=(
+                        success_message.id
+                        if success_message
+                        else None
+                    ),
+                    user=query.from_user,
+                    count=count
+                )
+            )
+
+        # ====================================================
+        # LOG
+        # ====================================================
+
+        try:
+
+            user = query.from_user
+
+            first_name = (
+                user.first_name
+                or "User"
+            )
+
+            last_name = (
+                user.last_name
+                or ""
+            )
+
+            full_name = (
+                f"{first_name} {last_name}"
+                .strip()
+            )
+
+            username = (
+                f"@{user.username}"
+                if user.username
+                else "N/A"
+            )
+
+            clickable_name = (
+                f'<a href="tg://user?id={user.id}">'
+                f'{html.escape(full_name)}'
+                f'</a>'
+            )
+
+            # ====================================================
+            # FILE DETAILS
+            # ====================================================
+
+            file_lines = []
+
+            for index, file in enumerate(
+                files,
+                start=1
+            ):
+
+                file_name = get_actual_file_name(
+                    file
+                )
+
+                movie_name = str(
+                    file.get("movie_name")
+                    or ""
+                ).strip()
+
+                if (
+                    not movie_name
+                    or movie_name.lower() == "unknown"
+                ):
+
+                    movie_name = file_name
+
+                year = str(
+                    file.get("year")
+                    or ""
+                ).strip()
+
+                if (
+                    not year
+                    or year.lower() == "unknown"
+                ):
+
+                    year = ""
+
+                quality = str(
+                    file.get("quality")
+                    or ""
+                ).strip()
+
+                if (
+                    not quality
+                    or quality.lower() == "unknown"
+                ):
+
+                    quality = ""
+
+                audio = format_audio(
+                    file.get("audio")
+                )
+
+                if audio.lower() == "unknown":
+
+                    audio = ""
+
+                title_parts = [
+                    str(movie_name)
+                ]
+
+                if year:
+
+                    title_parts.append(
+                        year
+                    )
+
+                if quality:
+
+                    title_parts.append(
+                        quality
+                    )
+
+                if audio:
+
+                    title_parts.append(
+                        audio
+                    )
+
+                display_title = " • ".join(
+                    title_parts
+                )
+
+                file_lines.append(
+                    f"{index}. "
+                    f"{html.escape(display_title)}\n"
+                    f"   📄 "
+                    f"{html.escape(str(file_name))}"
+                )
+
+            files_text = "\n".join(
+                file_lines
+            )
+
+            # ====================================================
+            # SEND LOG
+            # ====================================================
+
+            log_text = (
+                "📤 <b>SEND ALL USED</b>\n\n"
+
+                "👤 <b>User Details</b>\n"
+                f"Name: {clickable_name}\n"
+                f"Username: {html.escape(username)}\n"
+                f"User ID: <code>{user.id}</code>\n"
+                f"Chat ID: <code>{user_id}</code>\n\n"
+
+                "🔎 <b>Search</b>\n"
+                f"{html.escape(str(search_text))}\n\n"
+
+                "📦 <b>Send All Details</b>\n"
+                f"Files Sent: <code>{count}</code>\n"
+                f"Auto Delete: <code>5 Minutes</code>\n\n"
+
+                "📁 <b>Files</b>\n"
+                f"{files_text}"
+            )
+
+            await send_log(
+                log_text
+            )
+
+        except Exception as log_error:
+
+            print(
+                f"⚠️ Send All Log Error: "
+                f"{log_error}",
+                flush=True
+            )
+
+    except Exception as e:
+
+        print(
+            f"❌ SEND ALL ERROR: {e}",
+            flush=True
+        )
+
+        try:
+
+            await query.answer(
+                "❌ Error while sending files",
+                show_alert=True
+            )
+
+        except Exception:
+
+            pass
+
+
+# ============================================================
+# BACK SEARCH (HELPER)
+# ============================================================
+
+async def back_search(
+    client,
+    query: CallbackQuery
+):
+
+    try:
+
+        if await check_expiry(
+            query
+        ):
+
+            return
+
+        parts = query.data.split(
+            ":"
+        )
+
+        if len(parts) != 3:
+
+            return await query.answer(
+                "❌ Invalid back button",
+                show_alert=True
+            )
+
+        _, search_id, timestamp = parts
+
+        cache = await db_models.get_search_cache(
+            search_id
+        )
+
+        if not cache:
+
+            return await query.answer(
+                "❌ Search expired",
+                show_alert=True
+            )
+
+        selected_language = "All"
+
+        results = cache.get(
+            "files",
+            []
+        )
+
+        if not results:
+
+            return await query.answer(
+                "❌ No files found",
+                show_alert=True
+            )
+
+        current_files = results[
+            :FILES_PER_PAGE
+        ]
+
+        await db_models.update_search_state(
+            search_id,
+            current_files,
+            selected_language,
+            1
+        )
+
+        buttons = []
+
+        for file in current_files:
+
+            buttons.append(
+                [
+                    file_button(
+                        file,
+                        query.from_user.id,
+                        timestamp
+                    )
+                ]
+            )
+
+        buttons.extend(
+            language_buttons(
+                search_id,
+                timestamp,
+                selected_language
+            )
+        )
+
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    "📤 Send All",
+                    callback_data=(
+                        f"all:"
+                        f"{query.from_user.id}:"
+                        f"{search_id}:"
+                        f"{timestamp}"
+                    )
+                )
+            ]
+        )
+
+        buttons.extend(
+            pagination_buttons(
+                search_id,
+                1,
+                len(results),
+                timestamp
+            )
+        )
+
+        await query.message.edit_reply_markup(
+            InlineKeyboardMarkup(
+                buttons
+            )
+        )
+
+        await query.answer(
+            "↩ All languages selected"
+        )
+
+    except Exception as e:
+
+        print(
+            f"❌ BACK ERROR: {e}",
+            flush=True
+        )
+
+        try:
+
+            await query.answer(
+                "❌ Error",
+                show_alert=True
+            )
+
+        except Exception:
+
+            pass
+
+
+
+# ============================================================
+# CLOSE BUTTON CALLBACK
+# ============================================================
+
+@app.on_callback_query(
+    filters.regex(r"^close$")
+)
+async def close_menu_callback(
+    client,
+    query: CallbackQuery
+):
+    """Deletes menu on close button click."""
+    try:
+        await query.message.delete()
+        await query.answer("Closed ✖")
+    except Exception:
+        try:
+            await query.answer()
+        except Exception:
+            pass
+
+
+
+# ============================================================
+# SEARCH INSTRUCTIONS ALERT CALLBACK
+# ============================================================
+
+@app.on_callback_query(filters.regex(r"^search_instructions$"))
+async def search_instructions_callback(client, query: CallbackQuery):
+    alert_text = (
+        "📝 MOVIE REQUEST FORMAT -\n\n"
+        "Salaar OR Salaar 2023\n\n"
+        "📝 TV SERIES REQUEST FORMAT -\n\n"
+        "Save The Tigers OR Save The Tigers S01E01 OR Save The Tigers S01 E01\n\n"
+        "DON'T USE SYMBOLS....‼️"
+    )
+    await query.answer(alert_text, show_alert=True)
+
+
+# ============================================================
+# IMDb / SPELLING / FRANCHISE SELECTION CALLBACK
+# ============================================================
+
+@app.on_callback_query(
+    filters.regex(r"^spell:(\d+):([A-Za-z0-9]+)$")
+)
+async def spelling_suggestion_callback(
+    client,
+    query: CallbackQuery
+):
+    """
+    Handles IMDb / spelling / franchise selection.
+
+    Callback format:
+        spell:<user_id>:<token>
+
+    Example:
+        spell:123456789:fe992c731da8
+
+    The token is NOT searched directly.
+    It is converted back to the actual IMDb title using
+    search_handler.IMDB_SELECTIONS.
+
+    Year is PRESERVED.
+
+    Example:
+        token
+          ↓
+        Pushpa 2 (2024)
+          ↓
+        execute_search("Pushpa 2 (2024)")
+    """
+
+    try:
+
+        # ====================================================
+        # GET USER ID + TOKEN
+        # ====================================================
+
+        match = query.matches[0]
+
+        target_user_id = int(
+            match.group(1)
+        )
+
+        token = match.group(2)
+
+        # ====================================================
+        # USER CHECK
+        # ====================================================
+
+        if query.from_user.id != target_user_id:
+
+            await query.answer(
+                "⚠️ This selection is not for you.",
+                show_alert=True
+            )
+
+            return
+
+        # ====================================================
+        # IMPORT SEARCH MODULE
+        # ====================================================
+
+        from handlers import search as search_handler
+
+        # ====================================================
+        # TOKEN → ACTUAL IMDb TITLE
+        # ====================================================
+
+        selected_movie = (
+            search_handler.IMDB_SELECTIONS.get(
+                token
+            )
+        )
+
+        # ====================================================
+        # TOKEN NOT FOUND / EXPIRED
+        # ====================================================
+
+        if not selected_movie:
+
+            await query.answer(
+                "⚠️ This IMDb selection expired. Please search again.",
+                show_alert=True
+            )
+
+            return
+
+        # ====================================================
+        # KEEP YEAR EXACTLY
+        #
+        # Example:
+        # Pushpa 2 (2024)
+        #
+        # DO NOT remove year.
+        # ====================================================
+
+        selected_movie = str(
+            selected_movie
+        ).strip()
+        # Remove special characters/symbols
+        # Keep only letters, numbers and spaces
+        selected_movie = re.sub(
+            r"[^A-Za-z0-9\s]",
+            " ",
+            selected_movie
+        )
+        # Remove extra spaces 
+        selected_movie = re.sub(
+            r"\s+",
+            " ",
+            selected_movie
+        ).strip()
+
+        # ====================================================
+        # REMOVE USED TOKEN
+        # ====================================================
+
+        search_handler.IMDB_SELECTIONS.pop(
+            token,
+            None
+        )
+
+        # ====================================================
+        # SEARCHING ALERT
+        # ====================================================
+
+        await query.answer(
+            f"🔎 Searching: {selected_movie}"
+        )
+
+        # ====================================================
+        # GET ORIGINAL USER MESSAGE ID
+        # ====================================================
+
+        reply_to_id = None
+
+        try:
+
+            if (
+                query.message
+                and query.message.reply_to_message
+            ):
+
+                reply_to_id = (
+                    query.message
+                    .reply_to_message
+                    .id
+                )
+
+        except Exception:
+
+            reply_to_id = None
+
+        # ====================================================
+        # DELETE IMDb SELECTION MENU
+        # ====================================================
+
+        try:
+
+            if query.message:
+
+                await query.message.delete()
+
+        except Exception:
+
+            pass
+
+        # ====================================================
+        # EXECUTE SEARCH
+        # ====================================================
+
+        await search_handler.execute_search(
+            client=client,
+            user=query.from_user,
+            chat_id=query.message.chat.id,
+            movie_name=selected_movie,
+            reply_to_message_id=reply_to_id,
+            allow_spelling_suggestions=False
+        )
+
+    except Exception as e:
+
+        print(
+            f"❌ IMDb SELECTION CALLBACK ERROR: {e}",
+            flush=True
+        )
+
+        try:
+
+            await query.answer(
+                "❌ Failed to process movie selection.",
+                show_alert=True
+            )
+
+        except Exception:
+
+            pass
